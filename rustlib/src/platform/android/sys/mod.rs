@@ -18,6 +18,7 @@
 
 pub mod activity;
 pub mod asset;
+pub mod choreographer;
 pub mod input;
 pub mod keycodes;
 pub mod log;

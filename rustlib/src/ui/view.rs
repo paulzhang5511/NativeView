@@ -67,6 +67,10 @@ pub struct View {
     visibility: Visibility,
     enabled: bool,
     clickable: bool,
+    focusable: bool,
+    focused: bool,
+    /// 按压态（M3 状态层输入：组件据此叠 10% on_* 色）。
+    pressed: bool,
     alpha: f32,
     translation_x: f32,
     translation_y: f32,
@@ -126,6 +130,9 @@ impl View {
             visibility: Visibility::Visible,
             enabled: true,
             clickable: false,
+            focusable: false,
+            focused: false,
+            pressed: false,
             alpha: 1.0,
             translation_x: 0.0,
             translation_y: 0.0,
@@ -205,9 +212,54 @@ impl View {
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
+    /// 是否按压（M3 状态层输入；可交互组件在 touch 时维护）。
+    pub fn is_pressed(&self) -> bool {
+        self.pressed
+    }
+    /// 设置按压态。
+    ///
+    /// # 不变量
+    /// 框架不自动清除：由组件的 touch 处理（ACTION_UP/CANCEL）负责复位。
+    pub fn set_pressed(&mut self, p: bool) {
+        self.pressed = p;
+    }
     /// 设置启用状态。
     pub fn set_enabled(&mut self, e: bool) {
         self.enabled = e;
+    }
+    /// 是否可聚焦（PRD §5.1.9：V1 仅标记，无 D-pad 焦点遍历）。
+    pub fn is_focusable(&self) -> bool {
+        self.focusable
+    }
+    /// 设置可聚焦性。
+    ///
+    /// # V1 语义
+    /// 仅影响 IME 聚焦资格判定（EditText 默认可聚焦）；不可聚焦视图的
+    /// `requestFocus` 返回 false。不做焦点遍历（无硬件键盘导航场景）。
+    pub fn set_focusable(&mut self, f: bool) {
+        self.focusable = f;
+    }
+    /// 是否持有焦点（IME 语义：焦点控件持有光标与键盘输入）。
+    pub fn has_focus(&self) -> bool {
+        self.focused
+    }
+    /// 请求焦点。
+    ///
+    /// # 返回
+    /// false = 不可聚焦或 GONE（与 Android `requestFocus` 一致）。
+    ///
+    /// # V1 语义（PRD §5.1.9）
+    /// 只做标记，不做焦点树维护（前持有者的清理由容器层/IME 层负责）。
+    pub fn request_focus(&mut self) -> bool {
+        if !self.focusable || self.visibility == Visibility::Gone {
+            return false;
+        }
+        self.focused = true;
+        true
+    }
+    /// 清除焦点（失焦回调/IME 收起时由持有方调用）。
+    pub fn clear_focus(&mut self) {
+        self.focused = false;
     }
     /// 是否可点击。
     pub fn is_clickable(&self) -> bool {
@@ -488,5 +540,54 @@ fn resolve_default(spec: MeasureSpec) -> f32 {
     match spec.mode() {
         Mode::Exactly => spec.size() as f32,
         Mode::AtMost | Mode::Unspecified => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 默认不可聚焦（对齐 Android View：仅可交互控件默认 focusable）。
+    #[test]
+    fn default_not_focusable() {
+        let v = View::new();
+        assert!(!v.is_focusable());
+        assert!(!v.has_focus());
+    }
+
+    /// 不可聚焦时 requestFocus 被拒绝。
+    #[test]
+    fn request_focus_rejected_when_not_focusable() {
+        let mut v = View::new();
+        assert!(!v.request_focus());
+        assert!(!v.has_focus());
+    }
+
+    /// 可聚焦时 requestFocus 成功并置位。
+    #[test]
+    fn request_focus_marks_focused() {
+        let mut v = View::new();
+        v.set_focusable(true);
+        assert!(v.request_focus());
+        assert!(v.has_focus());
+    }
+
+    /// GONE 视图不可聚焦（即使标记为 focusable）。
+    #[test]
+    fn gone_view_cannot_focus() {
+        let mut v = View::new();
+        v.set_focusable(true);
+        v.set_visibility(Visibility::Gone);
+        assert!(!v.request_focus());
+    }
+
+    /// clear_focus 复位焦点标记。
+    #[test]
+    fn clear_focus_resets() {
+        let mut v = View::new();
+        v.set_focusable(true);
+        v.request_focus();
+        v.clear_focus();
+        assert!(!v.has_focus());
     }
 }

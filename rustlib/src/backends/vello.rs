@@ -29,7 +29,7 @@ impl VelloBackend {
 
 #[cfg(target_os = "android")]
 impl Backend for VelloBackend {
-    fn render_frame(&mut self, scene: &Scene) -> Result<(), ()> {
+    fn render_frame(&mut self, mut scene: Scene) -> Result<(), ()> {
         render_pixmap_frame(&mut self.base, scene)
     }
 

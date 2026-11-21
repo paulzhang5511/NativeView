@@ -30,13 +30,13 @@ use crate::gfx::scene::Scene;
 /// - `render_frame` 借用窗口，后端存活期间窗口必须有效；
 /// - 后端不持有窗口所有权：glue 在 `onNativeWindowDestroyed` 前先 drop 后端。
 pub trait Backend {
-    /// 渲染一帧并上屏。
+    /// 渲染一帧并上屏（消费 Scene 所有权，避免调用方 clone）。
     ///
     /// # 失败语义
     /// 返回 `Err` 表示本帧失败（surface 失效/上下文丢失），调用方记录日志；
     /// 连续失败达到阈值时由选择层触发降级（Task 8）。
     #[cfg(target_os = "android")]
-    fn render_frame(&mut self, scene: &Scene) -> Result<(), ()>;
+    fn render_frame(&mut self, scene: Scene) -> Result<(), ()>;
 
     /// 窗口尺寸变化（surface 重配）。
     ///
@@ -96,7 +96,7 @@ impl AnyBackend {
 
 #[cfg(target_os = "android")]
 impl Backend for AnyBackend {
-    fn render_frame(&mut self, scene: &Scene) -> Result<(), ()> {
+    fn render_frame(&mut self, scene: Scene) -> Result<(), ()> {
         match self {
             #[cfg(feature = "cpu")]
             AnyBackend::Cpu(b) => b.render_frame(scene),

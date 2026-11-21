@@ -1,9 +1,9 @@
-# 默认交叉编译到 Android aarch64：
-# 日常 `cargo build` / `cargo check` 直接产出 arm64 产物，无需显式 -t；
-# host 侧 `cargo test` 需显式 `--target x86_64-pc-windows-msvc`（或临时清空此配置），
-# 否则测试产物为 Android 目标无法在 Windows 上运行。
-[build]
-target = "aarch64-linux-android"
+# 不设默认 target：裸 `cargo build` / `cargo test` 在主机（Windows）直接可跑，
+# 满足 AGENTS.md「桌面端可 cargo test」约束。
+# Android 交叉编译一律显式指定：
+#   cargo ndk -t arm64-v8a -o ./jniLibs build --release
+# 16KB page size 是 Android 15+ 加载 .so 的硬性要求（PRD §12.R8/A11），
+# 因此所有 Android 目标的链接对齐都在此固定，防命令行遗漏。
 
 [target.aarch64-linux-android]
 rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

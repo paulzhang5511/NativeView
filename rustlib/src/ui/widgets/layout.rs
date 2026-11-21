@@ -725,7 +725,7 @@ mod padding_tests {
         let mut gone = View::new();
         gone.set_visibility(Visibility::Gone);
         col.add_child(gone, MarginLayoutParams::new(-1, 100), Gravity::TOP);
-        let mut b = View::new();
+        let b = View::new();
         col.add_child(b, MarginLayoutParams::new(-1, 100), Gravity::TOP);
 
         col.measure(

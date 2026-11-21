@@ -159,7 +159,10 @@ impl ScrollView {
     }
 
     /// 手势结束时判定是否进入惯性（速度阈值 120px/s ≈ 轻微快滑）。
-    fn end_drag(&mut self, event: &MotionEvent) {
+    ///
+    /// # 参数
+    /// `event`：保留给后续速度采样细化（V1 用最后一帧增量近似）。
+    fn end_drag(&mut self, _event: &MotionEvent) {
         self.dragging = false;
         if self.fling_velocity.abs() >= 120.0 {
             self.fling_active = true;

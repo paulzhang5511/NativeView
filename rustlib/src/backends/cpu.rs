@@ -23,6 +23,10 @@ use crate::gfx::scene::Scene;
 #[cfg(target_os = "android")]
 pub struct CpuBackend {
     window: Window,
+    /// 上一帧 Scene（帧间 diff 用；首帧 None → 整帧）。
+    prev_scene: Option<Scene>,
+    /// 持久像素缓冲（帧间复用；窗口多缓冲内容不持久，必须自持）。
+    pixmap: Option<crate::gfx::render::Pixmap>,
 }
 
 #[cfg(target_os = "android")]
@@ -33,15 +37,31 @@ impl CpuBackend {
     /// `setBuffersGeometry` 失败返回 `Err`（surface 状态异常），调用方降级跳帧。
     pub fn new(window: Window) -> Result<Self, ()> {
         window.set_rgba8888()?;
-        Ok(Self { window })
+        Ok(Self {
+            window,
+            prev_scene: None,
+            pixmap: None,
+        })
     }
 }
 
 #[cfg(target_os = "android")]
 impl Backend for CpuBackend {
-    /// V1 资源复用策略：RenderContext/Resources/Pixmap 全量重建（重建
-    /// 开销远小于逐帧光栅化，且窗口尺寸变化时必须重建）。
-    fn render_frame(&mut self, scene: &Scene) -> Result<(), ()> {
+    /// 帧调度（PRD §12.R9）：
+    /// 1. 与上一帧 diff：无变化 → 跳过（不 lock/post，静止帧零开销）；
+    /// 2. 有变化 → 仅重绘脏区到持久 Pixmap（damage-based partial redraw），
+    ///    脏区外像素保持上一帧内容（避免全帧光栅化）；
+    /// 3. 持久 Pixmap 整帧 memcpy 到窗口缓冲（多缓冲模型要求整帧上屏）。
+    fn render_frame(&mut self, mut scene: Scene) -> Result<(), ()> {
+        // 先 diff（不 lock）：静止帧直接返回，避免无谓的 lock/post。
+        if let (Some(prev), Some(pm)) = (&self.prev_scene, &self.pixmap) {
+            if pm.width() == scene.width as u16 && pm.height() == scene.height as u16 {
+                if crate::gfx::render::diff_damage(prev, &scene).is_none() {
+                    return Ok(()); // 静止帧：不上屏。
+                }
+            }
+        }
+
         let mut buffer = self.window.lock()?;
         let (w, h) = buffer.size();
         let stride = buffer.stride();
@@ -50,17 +70,37 @@ impl Backend for CpuBackend {
             return Err(());
         }
         let (w, h) = (w as u16, h as u16);
-
-        // 命令级软件光栅化（gfx::render 翻译层，含裁剪/路径/渐变/字形）。
-        let mut scene = scene.clone();
         scene.width = u32::from(w);
         scene.height = u32::from(h);
-        let Some(pixmap) = crate::gfx::render::render_scene(&scene) else {
-            return Err(());
-        };
+
+        // 持久 Pixmap 尺寸变化或首帧 → 全帧重建；否则仅重绘脏区。
+        let need_full = self.pixmap.is_none()
+            || self.pixmap.as_ref().unwrap().width() != w
+            || self.pixmap.as_ref().unwrap().height() != h
+            || self.prev_scene.is_none();
+
+        if need_full {
+            let Some(pixmap) = crate::gfx::render::render_scene(&scene) else {
+                return Err(());
+            };
+            self.pixmap = Some(pixmap);
+        } else {
+            // 局部重绘：仅光栅化脏区行段，脏区外像素保持上一帧。
+            let prev = self.prev_scene.as_ref().unwrap();
+            let damage =
+                crate::gfx::render::diff_damage(prev, &scene).unwrap_or(crate::gfx::scene::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: f64::from(w),
+                    h: f64::from(h),
+                });
+            let pm = self.pixmap.as_mut().unwrap();
+            let _ = crate::gfx::render::render_damage(&scene, pm, &damage);
+        }
+        self.prev_scene = Some(scene);
 
         // 逐行搬入窗口缓冲（Pixmap 紧凑 → 按 stride 步进）。
-        let src = pixmap.data_as_u8_slice();
+        let src = self.pixmap.as_ref().unwrap().data_as_u8_slice();
         let row = (w as usize) * 4;
         let pitch = (stride as usize) * 4;
         let dst = buffer.pixels_mut();

@@ -51,8 +51,13 @@ impl EditText {
     /// 创建空编辑框（默认文本类型 + Done 语义）。
     pub fn new() -> Self {
         let mut text_view = TextView::new();
-        // 编辑框默认可点击（点击请求焦点）。
+        // M3 字阶：body_large（16sp，编辑文本域默认）。
+        text_view.set_text_style(crate::ui::theme::typography::SCALE.body_large);
+        // M3 文本域内边距：16dp 水平、16dp 垂直。
+        text_view.view.set_padding_dp(16.0, 16.0, 16.0, 16.0);
+        // 编辑框默认可点击（点击请求焦点）且可聚焦（IME 焦点资格）。
         text_view.view.set_clickable(true);
+        text_view.view.set_focusable(true);
         Self {
             text_view,
             input_type: InputType::Text,
@@ -177,6 +182,8 @@ impl EditText {
     /// 点击：请求输入焦点（经焦点管理器排队，帧回调内下发平台）。
     fn request_focus(&mut self) {
         self.focused = true;
+        // 与 View 基类焦点标记保持一致（无障碍可聚焦语义来源）。
+        self.text_view.view.request_focus();
         self.text_view.view.request_layout();
         manager::request_focus(self.input_type, self.ime_options, self.text().to_string());
     }
@@ -191,8 +198,33 @@ impl EditText {
         self.text_view.layout(left, top, right, bottom);
     }
 
-    /// 绘制：背景 + 文本 + composing 下划线 + 插入光标。
+    /// 绘制：M3 outlined 边框 + 文本 + composing 下划线 + 插入光标。
+    ///
+    /// 边框语义（M3 TextField outlined）：
+    /// - 默认：outline 角色 1dp；
+    /// - 聚焦：primary 角色 2dp；
+    /// 光标用 primary 色（M3 caret token）。
     pub fn draw(&self, scene: &mut Scene) {
+        let t = crate::ui::theme::theme();
+        let v = &self.text_view.view;
+        let (stroke_color, stroke_w) = if self.focused {
+            (t.roles.primary, crate::ui::dimen::dp(2.0))
+        } else {
+            (t.roles.outline, crate::ui::dimen::dp(1.0))
+        };
+        let radius = crate::ui::dimen::dp(4.0);
+        scene.commands.push(crate::gfx::scene::Command::StrokePath {
+            path: crate::gfx::path::Path::rounded_rect(
+                f64::from(v.left()),
+                f64::from(v.top()),
+                f64::from(v.width()),
+                f64::from(v.height()),
+                f64::from(radius),
+            ),
+            paint: crate::gfx::paint::Paint::default()
+                .color(stroke_color)
+                .stroke_width(stroke_w),
+        });
         self.text_view.draw(scene);
         let layout = self.layout_ref();
         if let (Some((start, end)), Some(layout)) = (self.composing, layout) {
@@ -221,6 +253,8 @@ impl EditText {
         let size = f64::from(layout.font_size());
         // 2dp 宽，高一个字号（高密度设备上仍清晰可见）。
         let w = f64::from(crate::ui::dimen::dp(2.0)).max(1.0);
+        // 光标色：M3 primary 角色（聚焦强调色，替代旧版硬编码蓝）。
+        let caret_color = crate::ui::theme::theme().roles.primary;
         scene.commands.push(crate::gfx::scene::Command::FillRect {
             rect: crate::gfx::scene::Rect {
                 x: caret_x,
@@ -228,8 +262,7 @@ impl EditText {
                 w,
                 h: size,
             },
-            paint: crate::gfx::paint::Paint::default()
-                .color(crate::gfx::color::Color::rgb(0x20, 0x82, 0xF8)),
+            paint: crate::gfx::paint::Paint::default().color(caret_color),
         });
     }
 

@@ -31,6 +31,14 @@ pub enum A11yRole {
     Image,
     /// 可编辑文本框（`android.widget.EditText`）。
     EditText,
+    /// 复选框（`android.widget.CheckBox`，TalkBack 播报「已选中/未选中」）。
+    Checkbox,
+    /// 单选按钮（`android.widget.RadioButton`）。
+    RadioButton,
+    /// 开关（`android.widget.Switch`）。
+    Switch,
+    /// 滑块（`android.widget.SeekBar`，TalkBack 播报当前进度）。
+    Slider,
 }
 
 impl A11yRole {
@@ -45,6 +53,10 @@ impl A11yRole {
             A11yRole::Button => "android.widget.Button",
             A11yRole::Image => "android.widget.ImageView",
             A11yRole::EditText => "android.widget.EditText",
+            A11yRole::Checkbox => "android.widget.CheckBox",
+            A11yRole::RadioButton => "android.widget.RadioButton",
+            A11yRole::Switch => "android.widget.Switch",
+            A11yRole::Slider => "android.widget.SeekBar",
             A11yRole::None => "android.view.View",
         }
     }

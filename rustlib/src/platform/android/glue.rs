@@ -42,6 +42,13 @@ static LAST_IME_INSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 /// 上次推送无障碍快照时的页树代数（去重，避免每帧重推）。
 static LAST_A11Y_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
+/// 状态保存交接槽（主循环线程写 JSON，onSaveInstanceState 回调线程读走）。
+///
+/// # 线程模型
+/// 主循环每轮把当前状态序列化后覆盖写入；回调线程原子 take。
+/// 任何时刻只有一方持有内容，无需额外同步。
+static SAVED_STATE_SLOT: Mutex<Option<String>> = Mutex::new(None);
+
 /// 首帧清屏颜色（深灰，肉眼可辨于黑屏/未绘制）。
 /// V1 首帧场景由 `demo_scene` 提供，此常量保留给后续错误路径 fallback。
 
@@ -98,6 +105,8 @@ struct Shared {
     /// 原生活动生命周期覆盖主循环线程存活期（onDestroy join 在后），
     /// 因此从回调线程移交到主循环线程裸读是安全的。
     activity: SendPtr<ANativeActivity>,
+    /// Activity 重建时框架透传的已保存状态（主循环构造 Demo 前消费）。
+    saved_state: Option<crate::ui::state::SavedState>,
 }
 
 /// 框架入口：`ANativeActivity_onCreate`（PRD §6.4.1 入口符号）。
@@ -107,11 +116,13 @@ struct Shared {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ANativeActivity_onCreate(
     activity: *mut ANativeActivity,
-    _saved_state: *mut core::ffi::c_void,
-    _saved_state_size: usize,
+    saved_state: *mut core::ffi::c_void,
+    saved_state_size: usize,
 ) {
     // 启动链路第 2 步：先装日志后端，后续所有路径可观测。
     AndroidLogger::install();
+    // A1 冷启动计时起点（日志后端就绪后第一件事）。
+    crate::platform::perf::mark_boot_start();
     info!("NativeActivity onCreate");
 
     // SAFETY: callbacks 由框架分配且非空（框架协议）；写回调表签名与 NDK
@@ -135,6 +146,26 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     // 记录 fd 供 JNI 侧（IME 桥）跨线程唤醒主循环。
     WAKE_FD.store(wake.fd as i32, std::sync::atomic::Ordering::Release);
 
+    // Activity 重建恢复：解析框架透传的 UTF-8 JSON 载荷（PRD §5.1.9
+    // 状态保存子集）。失败按冷启动处理。
+    let restored = if !saved_state.is_null() && saved_state_size > 0 {
+        // SAFETY: 框架传入的缓冲在回调期间有效；长度由框架保证。
+        let bytes =
+            unsafe { std::slice::from_raw_parts(saved_state as *const u8, saved_state_size) };
+        match std::str::from_utf8(bytes) {
+            Ok(json) => crate::ui::state::SavedState::from_json(json),
+            Err(e) => {
+                warn!("saved state not utf-8, cold start: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(state) = &restored {
+        info!("state restored: {} entries", state.len());
+    }
+
     let shared: Arc<Mutex<Shared>> = Arc::new(Mutex::new(Shared {
         window_new: None,
         window_gone: false,
@@ -150,6 +181,8 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
         wake: Some(wake),
         loop_thread: None,
         activity: SendPtr(activity),
+        /// onCreate 重建场景的状态载荷（主循环首帧前消费一次）。
+        saved_state: restored,
     }));
 
     // 主循环线程：拉起失败时降级为空 activity（记录日志并请求结束）。
@@ -217,6 +250,7 @@ unsafe fn register_callbacks(callbacks: *mut ANativeActivityCallbacks) {
         (*callbacks).on_resume = Some(on_resume);
         (*callbacks).on_pause = Some(on_pause);
         (*callbacks).on_stop = Some(on_stop);
+        (*callbacks).on_save_instance_state = Some(on_save_instance_state);
         (*callbacks).on_destroy = Some(on_destroy);
         (*callbacks).on_window_focus_changed = Some(on_window_focus_changed);
         (*callbacks).on_native_window_created = Some(on_native_window_created);
@@ -376,6 +410,54 @@ unsafe extern "C" fn on_pause(activity: *mut ANativeActivity) {
 unsafe extern "C" fn on_stop(activity: *mut ANativeActivity) {
     debug!("onStop");
     let _ = unsafe { shared_of(activity) };
+}
+
+/// 状态保存：向框架返回 malloc 分配的 JSON 缓冲（框架负责 free）。
+///
+/// # 契约（NDK `native_activity.h`）
+/// 返回的指针必须由 `malloc` 分配；`*out_size` 写入字节数。
+/// 返回 NULL = 无状态保存。
+///
+/// # 数据流
+/// 主循环线程持有 Demo 状态：经全局槽（`Mutex<Option<String>>`）
+/// 交接，主循环下一轮填充；为不阻塞回调线程，此回调直接读槽，
+/// 槽空时（首存/尚未填充）返回 NULL，框架按无状态处理。
+unsafe extern "C" fn on_save_instance_state(
+    activity: *mut ANativeActivity,
+    out_size: *mut usize,
+) -> *mut core::ffi::c_void {
+    debug!("onSaveInstanceState");
+    if out_size.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Some(_shared) = (unsafe { shared_of(activity) }) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: 状态槽由主循环线程写入、本回调线程在此读后清空；
+    // 指针解引用前已由 Mutex 保护；毒锁（主循环 panic 时）按无状态处理。
+    let payload = match unsafe { SAVED_STATE_SLOT.lock() } {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => {
+            debug!("state slot poisoned, treating as no state");
+            poisoned.into_inner().take()
+        }
+    };
+    let Some(json) = payload else {
+        debug!("no state saved yet (main loop has not filled the slot)");
+        return core::ptr::null_mut();
+    };
+    let bytes = json.as_bytes();
+    // SAFETY: malloc/free 配对由框架负责（头文件契约）；此处只负责分配。
+    let buf = unsafe { libc::malloc(bytes.len()) };
+    if buf.is_null() {
+        warn!("malloc failed for saved state");
+        return core::ptr::null_mut();
+    }
+    // SAFETY: buf 由刚分配的 len 字节，拷贝来源有效。
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len()) };
+    unsafe { *out_size = bytes.len() };
+    info!("state saved: {} bytes", bytes.len());
+    buf
 }
 
 unsafe extern "C" fn on_window_focus_changed(
@@ -637,6 +719,13 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
     let mut current_queue: Option<SafeInputQueue> = None;
     // 三页 Demo 宿主（Task 20）：窗口尺寸在首次 window created 时注入。
     let mut demo: Option<crate::demo::Demo> = None;
+    // A2 帧率统计（滚动/动画期间持续输出 P50/P95 汇总）。
+    let mut frame_stats = crate::platform::perf::FrameStats::new();
+    // FPS 叠加层（环境变量 NATIVEVIEW_FPS_HUD=1 门控，默认关闭）。
+    let mut fps_hud = crate::platform::perf::FpsHud::new();
+    // A3 RSS 采样间隔（静态页稳定后周期采样；滚动/动画时不采样，
+    // 避免 statm 读文件抖动混入帧时长）。
+    let mut last_rss_sample = std::time::Instant::now();
 
     loop {
         // 1) 同步交接状态（每轮全量拉取，唤醒丢失无正确性影响）。
@@ -721,9 +810,19 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                         // 首个窗口：构造 Demo（字体已由 onCreate 预加载进程缓存，
                         // 此处从全局字体缓存注入）。
                         let font = crate::text::font::cached_font();
-                        let d = crate::demo::Demo::new(w.width(), w.height(), font);
+                        let mut d = crate::demo::Demo::new(w.width(), w.height(), font);
+                        // Activity 重建：恢复上次状态（PRD §5.1.9 子集）。
+                        let restored = shared
+                            .lock()
+                            .expect("shared state lock poisoned")
+                            .saved_state
+                            .take();
+                        if let Some(state) = restored {
+                            d.restore_state(&state);
+                        }
+                        let scene = d.render();
                         demo = Some(d);
-                        demo.as_mut().unwrap().render()
+                        scene
                     } else {
                         // 窗口重建（旋转/分屏）：尺寸变更后重渲染。
                         demo.as_mut().unwrap().resize(w.width(), w.height());
@@ -737,9 +836,23 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                     );
                     match select_backend(raw as *mut std::ffi::c_void, w.width(), w.height()) {
                         Some(mut backend) => {
-                            match backend.render_frame(&scene) {
+                            match backend.render_frame(scene) {
                                 Ok(()) => {
-                                    info!("first frame presented ({}x{})", w.width(), w.height())
+                                    // A1 终点：首帧已上屏。
+                                    if let Some(ms) = crate::platform::perf::millis_since_boot() {
+                                        info!(
+                                            "first frame presented {}x{} in {}ms",
+                                            w.width(),
+                                            w.height(),
+                                            ms
+                                        );
+                                    } else {
+                                        info!(
+                                            "first frame presented ({}x{})",
+                                            w.width(),
+                                            w.height()
+                                        );
+                                    }
                                 }
                                 Err(()) => warn!("first frame render failed"),
                             }
@@ -761,7 +874,9 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                 d.resize(w as i32, h as i32);
                 b.resize(w, h);
                 let scene = d.render();
-                if b.render_frame(&scene).is_err() {
+                if b.render_frame(scene).is_ok() {
+                    frame_stats.record_frame();
+                } else {
                     warn!("resize frame render failed");
                 }
             } else if let Some(d) = demo.as_mut() {
@@ -776,7 +891,9 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                 d.cancel_touch();
                 if let Some(b) = _current_backend.as_mut() {
                     let scene = d.render();
-                    if b.render_frame(&scene).is_err() {
+                    if b.render_frame(scene).is_ok() {
+                        frame_stats.record_frame();
+                    } else {
                         warn!("cancel frame render failed");
                     }
                 }
@@ -786,7 +903,9 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
         if redraw {
             if let (Some(d), Some(b)) = (demo.as_mut(), _current_backend.as_mut()) {
                 let scene = d.render();
-                if b.render_frame(&scene).is_err() {
+                if b.render_frame(scene).is_ok() {
+                    frame_stats.record_frame();
+                } else {
                     warn!("redraw frame failed");
                 }
             }
@@ -819,7 +938,13 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
             info!("input queue attached");
         }
 
-        // 2) 等待事件：Draw 页动画时节拍为 16ms（近似 vsync），其余无限阻塞。
+        // 2) 填充状态保存槽（onSaveInstanceState 随时可读到最新状态）。
+        if let Some(d) = demo.as_ref() {
+            let json = d.save_state().to_json();
+            *SAVED_STATE_SLOT.lock().expect("state slot poisoned") = Some(json);
+        }
+
+        // 3) 等待事件：Draw 页动画时节拍为 16ms（近似 vsync），其余无限阻塞。
         // 无条件泵取输入（回调 NULL 的 attach 模式下，框架经 ALooper_wake
         // 唤醒本线程,pollOnce 可能返回 ALOOPER_POLL_WAKE 而非 LOOPER_ID_INPUT,
         // 事件实际在 AInputQueue 里——按 ident 分支会漏泵导致 ANR,故不分支)。
@@ -835,6 +960,8 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                     &mut demo,
                     &mut _current_backend,
                     Some(activity_ptr),
+                    &mut frame_stats,
+                    &mut fps_hud,
                 );
             }
         }
@@ -860,7 +987,9 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                         a11y_dirty = true;
                         if let Some(b) = _current_backend.as_mut() {
                             let scene = d.render();
-                            if b.render_frame(&scene).is_err() {
+                            if b.render_frame(scene).is_ok() {
+                                frame_stats.record_frame();
+                            } else {
                                 warn!("a11y click frame render failed");
                             }
                         }
@@ -909,7 +1038,9 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
             if ime_dirty {
                 if let (Some(d), Some(b)) = (demo.as_mut(), _current_backend.as_mut()) {
                     let scene = d.render();
-                    if b.render_frame(&scene).is_err() {
+                    if b.render_frame(scene).is_ok() {
+                        frame_stats.record_frame();
+                    } else {
                         warn!("ime frame render failed");
                     }
                 }
@@ -942,16 +1073,55 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
         // 近似 vsync 超时到达：推进 P2 动画并按需重绘（PRD §5.1.6：
         // 时间基准统一 Choreographer 帧回调——V1 以 poll 超时近似）。
         if ident == super::sys::looper::ALOOPER_POLL_TIMEOUT {
-            if let (Some(d), Some(b)) = (demo.as_mut(), _current_backend.as_mut()) {
+            let frame_result = if let (Some(d), Some(b)) =
+                (demo.as_mut(), _current_backend.as_mut())
+            {
                 // 单调时钟：墙上时钟跳变（NTP/用户改时间）会让动画倒退或冻结。
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let start = START.get_or_init(std::time::Instant::now);
                 let now = start.elapsed().as_millis() as u64;
+                // 调用链耗时分解：advance → build → render 三段独立计时。
+                let mut trace = crate::platform::perf::FrameTrace::new();
+                let adv_start = std::time::Instant::now();
                 if d.advance(now) {
-                    let scene = d.render();
-                    if b.render_frame(&scene).is_err() {
-                        warn!("animation frame render failed");
-                    }
+                    trace.set(crate::platform::perf::STAGE_ADVANCE, adv_start.elapsed());
+                    let build_start = std::time::Instant::now();
+                    let mut scene = d.render();
+                    fps_hud.draw(&mut scene, frame_stats.fps());
+                    trace.set(crate::platform::perf::STAGE_BUILD, build_start.elapsed());
+                    trace.cmd_count = scene.commands.len() as u32;
+                    let render_start = std::time::Instant::now();
+                    let ok = b.render_frame(scene).is_ok();
+                    trace.set(crate::platform::perf::STAGE_RENDER, render_start.elapsed());
+                    Some((ok, trace))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((ok, trace)) = frame_result {
+                if ok {
+                    frame_stats.record_render_time(
+                        trace.stages[crate::platform::perf::STAGE_RENDER] / 1000,
+                    );
+                    frame_stats.record_trace(&trace);
+                    frame_stats.record_frame();
+                } else {
+                    warn!("animation frame render failed");
+                }
+            }
+        }
+        // A3 内存采样：静止页每 2s 一次（statm 读文件有调度开销，
+        // 动画/滚动期间不采样，避免污染 A2 帧时长）。
+        if demo.as_ref().is_some() && last_rss_sample.elapsed().as_millis() >= 2_000 {
+            last_rss_sample = std::time::Instant::now();
+            if let Some(rss) = crate::platform::perf::sample_rss_kb() {
+                if rss < 1024 * 1024 {
+                    // < 1GB 正常路径：debug 级；超 1GB 升级 warn 便于 A3 判定。
+                    log::debug!("rss: {} KB", rss);
+                } else {
+                    log::warn!("rss high: {} KB", rss);
                 }
             }
         }
@@ -999,6 +1169,8 @@ fn pump_input(
     demo: &mut Option<crate::demo::Demo>,
     backend: &mut Option<AnyBackend>,
     activity: Option<*mut ANativeActivity>,
+    frame_stats: &mut crate::platform::perf::FrameStats,
+    fps_hud: &mut crate::platform::perf::FpsHud,
 ) {
     let Some(queue) = queue else { return };
     while queue.has_events() {
@@ -1024,7 +1196,7 @@ fn pump_input(
                     .map(|motion| {
                         let (x, y) = motion.primary().map(|p| (p.x, p.y)).unwrap_or((0.0, 0.0));
                         info!("motion: action={:?} x={:.1} y={:.1}", motion.action(), x, y);
-                        handle_motion(&motion, demo.as_mut(), backend)
+                        handle_motion(&motion, demo.as_mut(), backend, frame_stats, fps_hud)
                     })
                     .unwrap_or(false);
                 event.finish(handled);
@@ -1060,18 +1232,36 @@ fn handle_motion(
     motion: &crate::ui::input::MotionEvent,
     demo: Option<&mut crate::demo::Demo>,
     backend: &mut Option<AnyBackend>,
+    frame_stats: &mut crate::platform::perf::FrameStats,
+    fps_hud: &mut crate::platform::perf::FpsHud,
 ) -> bool {
     let Some(demo) = demo else { return false };
     let page_before = demo.current_page();
+    // 调用链耗时分解：dispatch_touch（手势/滚动物理 = advance）→ render（build）→ render_frame。
+    let mut trace = crate::platform::perf::FrameTrace::new();
+    let adv_start = std::time::Instant::now();
     let consumed = demo.dispatch_touch(motion);
+    trace.set(crate::platform::perf::STAGE_ADVANCE, adv_start.elapsed());
     let page_after = demo.current_page();
     if page_before != page_after {
         info!("page switched: {} -> {}", page_before, page_after);
     }
     if consumed {
-        let scene = demo.render();
+        let build_start = std::time::Instant::now();
+        let mut scene = demo.render();
+        fps_hud.draw(&mut scene, frame_stats.fps());
+        trace.set(crate::platform::perf::STAGE_BUILD, build_start.elapsed());
+        trace.cmd_count = scene.commands.len() as u32;
         if let Some(b) = backend.as_mut() {
-            if b.render_frame(&scene).is_err() {
+            let render_start = std::time::Instant::now();
+            let ok = b.render_frame(scene).is_ok();
+            trace.set(crate::platform::perf::STAGE_RENDER, render_start.elapsed());
+            if ok {
+                frame_stats
+                    .record_render_time(trace.stages[crate::platform::perf::STAGE_RENDER] / 1000);
+                frame_stats.record_trace(&trace);
+                frame_stats.record_frame();
+            } else {
                 warn!("touch frame render failed");
             }
         }

@@ -7,6 +7,8 @@ pub mod drawable;
 pub mod ime;
 pub mod input;
 pub mod measure_spec;
+pub mod state;
+pub mod theme;
 pub mod view;
 pub mod view_config;
 pub mod view_group;

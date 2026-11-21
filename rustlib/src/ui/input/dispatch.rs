@@ -135,8 +135,19 @@ impl Node<'_> {
     ///（子内容按 -scroll_y 绘制，命中测试把窗口坐标 y 补偿进内容
     /// 坐标系）；其余容器直接按窗口坐标递归。
     fn dispatch_child(&mut self, event: &MotionEvent) -> bool {
+        let p = LocalPoint {
+            x: event.primary().map(|c| c.x).unwrap_or(0.0),
+            y: event.primary().map(|c| c.y).unwrap_or(0.0),
+        };
         let mut consumed = false;
         self.for_each_child_mut(event, &mut |child, ev| {
+            // 命中测试：容器只向实际命中的子节点分发（对齐 Android
+            // ViewGroup.dispatchTouchEvent 的 hit 语义）。未命中的子节点
+            // 不应消费事件（如 ScrollView 的 on_scroll_handle 对 DOWN
+            // 无条件返回 true，若不做 hit 会吞掉页签的触摸）。
+            if !hit_test(child.view(), p) {
+                return false;
+            }
             // 子节点统一走 Node 分发语义（命中测试 → 拦截 → 子树 → 兜底），
             // 不能直接调 Widget trait 的 dispatch_touch（默认实现不递归）。
             if Node::Widget(child).dispatch_touch(ev) {

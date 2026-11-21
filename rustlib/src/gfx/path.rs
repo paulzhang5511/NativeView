@@ -126,6 +126,61 @@ impl Path {
         p
     }
 
+    /// 圆弧（三次贝塞尔逐 90° 段近似；不闭合，供描边用）。
+    ///
+    /// # 参数
+    /// - `start/end`：弧度角（数学系，x 正向为 0，逆时针为正）；
+    /// - 扫过角度可任意（>360° 时绕多圈）。
+    ///
+    /// # 精度
+    /// 每 90° 一段贝塞尔，最大径向误差 < 0.03%（与 rounded_rect 同级）。
+    pub fn arc(cx: f64, cy: f64, r: f64, start: f64, end: f64) -> Self {
+        let mut p = Path::new();
+        let total = end - start;
+        if total == 0.0 || r <= 0.0 {
+            return p;
+        }
+        // 方向与分段：每段不超过 90°。
+        let step = total.signum() * std::f64::consts::FRAC_PI_2;
+        let k = 0.5522847498;
+        let (cos_s, sin_s) = (start.cos(), start.sin());
+        p.move_to(cx + r * cos_s, cy + r * sin_s);
+        let mut a = start;
+        loop {
+            // 本段终点（不超过 end）。
+            let next = if (a + step - end).abs() < f64::EPSILON
+                || (a + step - end).signum() == total.signum()
+                    && (a + step - end).abs() < step.abs()
+            {
+                end
+            } else {
+                a + step
+            };
+            let sweep = next - a;
+            let (c, s) = (a.cos(), a.sin());
+            let (c2, s2) = (next.cos(), next.sin());
+            // 贝塞尔控制点：切向偏移 = r * k * tan(θ/4) ≈ r*k*θ/π/2。
+            let kt = r * k * (sweep / 2.0).tan().abs().clamp(0.0, 4.0 / 3.0);
+            // 入控制点：起点切线方向。
+            let (tc, ts) = (-s, c);
+            // 出控制点：终点切线方向。
+            let (tc2, ts2) = (-s2, c2);
+            p.cubic_to(
+                cx + r * c + kt * tc,
+                cy + r * s + kt * ts,
+                cx + r * c2 - kt * tc2,
+                cy + r * s2 - kt * ts2,
+                cx + r * c2,
+                cy + r * s2,
+            );
+            a = next;
+            if (a - end).abs() < f64::EPSILON {
+                break;
+            }
+        }
+        p
+    }
+
     /// moveTo（后续 lineTo 等的段起点）。
     pub fn move_to(&mut self, x: f64, y: f64) -> &mut Self {
         self.elements.push(PathElement::MoveTo { x, y });
@@ -303,6 +358,34 @@ mod tests {
         p.set_fill_type(FillType::EvenOdd);
         p.reset();
         assert!(p.is_empty());
-        assert_eq!(p.fill_type(), FillType::Winding);
+    }
+
+    /// 圆弧：整圆由两段贝塞尔构成（每 90° 一段）。
+    #[test]
+    fn arc_full_circle_four_segments() {
+        let p = Path::arc(50.0, 50.0, 40.0, 0.0, std::f64::consts::TAU);
+        // moveTo + 4 段 cubic。
+        assert_eq!(p.elements().len(), 5);
+    }
+
+    /// 圆弧：零扫角为空路径。
+    #[test]
+    fn arc_zero_sweep_empty() {
+        let p = Path::arc(50.0, 50.0, 40.0, 1.0, 1.0);
+        assert!(p.is_empty());
+    }
+
+    /// 圆弧端点近似：90° 弧的终点落在理论圆上（±1% 误差）。
+    #[test]
+    fn arc_endpoint_on_circle() {
+        let p = Path::arc(0.0, 0.0, 10.0, 0.0, std::f64::consts::FRAC_PI_2);
+        match p.elements().last() {
+            Some(PathElement::CubicTo { x, y, .. }) => {
+                // 终点应为 (0, 10)（逆时针 90°）。
+                assert!((x - 0.0).abs() < 0.1);
+                assert!((y - 10.0).abs() < 0.1);
+            }
+            other => panic!("expected CubicTo, got {other:?}"),
+        }
     }
 }

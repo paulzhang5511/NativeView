@@ -110,10 +110,7 @@ fn draw_line_glyphs(
 fn font() -> Option<vello_cpu::peniko::FontData> {
     let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> = match crate::text::font::cached_font() {
         Some(font) => Arc::new(font.shared()),
-        None => {
-            let bytes = FONT_BYTES.get()?;
-            Arc::new(bytes.clone())
-        }
+        None => Arc::new(Arc::clone(FONT_BYTES.get()?)),
     };
     Some(vello_cpu::peniko::FontData::new(
         vello_cpu::peniko::Blob::new(bytes),
@@ -128,13 +125,17 @@ pub fn scene_font() -> Option<vello_cpu::peniko::FontData> {
 
 /// 进程级字体字节（`text::font::load` 完成后填充；主机测试经
 /// `set_test_font` 注入）。
-static FONT_BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+///
+/// 存储 `Arc<[u8]>`：`font()` 每次调用都取一份句柄，若存裸 `Vec`
+/// 每次 `clone()` 都会整份复制 ~14MB（列表页 200 行 × 每行一次
+/// = ~2.8GB 瞬时分配）；Arc 克隆仅引用计数。
+static FONT_BYTES: std::sync::OnceLock<Arc<[u8]>> = std::sync::OnceLock::new();
 /// 注入字体字节（宿主装配或测试替身）。
 ///
 /// # 约束
 /// 只允许调用一次（首次生效）；字体切换不在 V1 范围。
 pub fn set_font_bytes(bytes: Vec<u8>) {
-    let _ = FONT_BYTES.set(bytes);
+    let _ = FONT_BYTES.set(Arc::from(bytes.into_boxed_slice()));
 }
 
 /// 把排版结果翻译为 `Scene` 命令（View 系绘制入口）。

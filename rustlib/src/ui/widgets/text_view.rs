@@ -106,6 +106,15 @@ impl TextView {
         self.set_font_size(crate::ui::dimen::sp(size_sp));
     }
 
+    /// 按 M3 字阶令牌设置字号与行距（`font_size` sp + 行高换算）。
+    ///
+    /// 行距 = 行高 − 字号（TextView 多行排版语义：乘数 = 行高/字号）。
+    pub fn set_text_style(&mut self, token: crate::ui::theme::typography::TypeToken) {
+        self.set_text_size_sp(token.font_size);
+        // 行距倍数还原 M3 行高（parley 相对乘数）。
+        self.set_line_spacing_multiplier(token.line_height / token.font_size);
+    }
+
     /// 当前字号（px）。
     pub fn font_size(&self) -> f32 {
         self.text_paint.font_size
@@ -247,11 +256,22 @@ impl TextView {
     }
 
     /// 绘制：背景 + 文本（经 Scene 中间表示，颜色进 DrawGlyphs 命令）。
+    ///
+    /// # 垂直对齐
+    /// `gravity` 含 `CENTER_VERTICAL` 时，文本在内容区（去掉上下 padding）
+    /// 内垂直居中；否则贴顶（默认，与 Android 单行 TextView 一致）。
     pub fn draw(&self, scene: &mut Scene) {
         self.view.draw(scene);
         if let Some(layout) = &self.layout {
             let x = f64::from(self.view.left() + self.view.padding_left());
-            let y = f64::from(self.view.top() + self.view.padding_top());
+            let mut y = f64::from(self.view.top() + self.view.padding_top());
+            if self.view.gravity().0 & crate::ui::view::Gravity::CENTER_VERTICAL.0 != 0 {
+                // 内容区高度 − 文本高度 = 富余空间，居中取半。
+                let content_h =
+                    self.view.height() - self.view.padding_top() - self.view.padding_bottom();
+                let dy = ((content_h - layout.height()).max(0.0)) / 2.0;
+                y += f64::from(dy);
+            }
             crate::text::render::emit_layout(scene, layout, x, y);
         }
     }

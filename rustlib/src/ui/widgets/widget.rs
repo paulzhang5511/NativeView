@@ -13,6 +13,7 @@
 //! 做手势注册键）。
 
 use crate::gfx::scene::Scene;
+use crate::ui::input::coords::{LocalPoint, hit_test};
 use crate::ui::measure_spec::MeasureSpec;
 use crate::ui::view::View;
 
@@ -40,8 +41,18 @@ pub trait Widget {
     /// 「可点击 → 手势状态机」；容器（拥有 `for_each_child_mut`）与
     /// 普通 View 因此共用同一默认实现。
     fn dispatch_touch(&mut self, event: &crate::ui::input::MotionEvent) -> bool {
+        let p = LocalPoint {
+            x: event.primary().map(|c| c.x).unwrap_or(0.0),
+            y: event.primary().map(|c| c.y).unwrap_or(0.0),
+        };
         let mut consumed = false;
         self.for_each_child_mut(event, &mut |child, ev| {
+            // 命中测试：只向实际命中的子节点分发（对齐 Android 语义）。
+            // 不做 hit 则第一个可点击子项消费 DOWN 后终止遍历，
+            // 后续兄弟（如页签条中实际被按的 tab）永远收不到事件。
+            if !hit_test(child.view(), p) {
+                return false;
+            }
             if child.dispatch_touch(ev) {
                 consumed = true;
                 true

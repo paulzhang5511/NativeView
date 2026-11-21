@@ -21,9 +21,9 @@ use super::Scene;
 /// 上传为纹理 blit 到 surface——非命令级 GPU 管线（vello 计算着色器
 /// 直渲归 V2）；V1 优先保证三后端共用同一 Scene 载体与正确像素输出。
 #[cfg(target_os = "android")]
-pub fn render_pixmap_frame(base: &mut GpuBase, scene: &Scene) -> Result<(), ()> {
+pub fn render_pixmap_frame(base: &mut GpuBase, scene: Scene) -> Result<(), ()> {
     let (w, h) = (base.width, base.height);
-    let mut scene = scene.clone();
+    let mut scene = scene;
     scene.width = w;
     scene.height = h;
     let Some(pixmap) = crate::gfx::render::render_scene(&scene) else {

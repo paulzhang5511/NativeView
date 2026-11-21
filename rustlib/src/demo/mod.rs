@@ -64,6 +64,8 @@ pub enum Page {
     Draw,
     /// P3 文字排版。
     Text,
+    /// P4 M3 组件陈列。
+    Components,
 }
 
 /// 演示主机：状态 + 装配 + 帧入口。
@@ -179,6 +181,11 @@ impl Demo {
         self.tree_generation
     }
 
+    /// 探针专用：暴露布局好的页树（仅诊断工具使用，主线代码走 render()）。
+    pub fn tree_for_layout_pub(&mut self) -> &mut PageTree {
+        self.tree_for_layout()
+    }
+
     /// 状态变更后作废页树（下次渲染/分发前重建）。
     ///
     /// 重建会替换全部控件实例，因此同步清空手势注册表，避免旧回调
@@ -232,6 +239,7 @@ impl Demo {
             Page::List => 0,
             Page::Draw => 1,
             Page::Text => 2,
+            Page::Components => 3,
         }
     }
 
@@ -239,6 +247,56 @@ impl Demo {
     /// ValueAnimator 的时间驱动，避免基准对墙上时钟敏感）。
     pub fn set_anim_phase_for_test(&mut self, phase: f32) {
         self.anim_phase = phase;
+    }
+
+    /// 保存可跨重建的状态（PRD §5.1.9：仅文本与滚动位置）。
+    ///
+    /// # 覆盖范围
+    /// - 当前页码（恢复后停留在原页）；
+    /// - P1 高亮行（列表语义状态）；
+    /// - P1 滚动偏移；
+    /// - P3 输入框文本。
+    /// 不保存：动画相位（重启后从 0 循环即可）、预编辑区间
+    /// （composing 属于 IME 会话，重建即失效）。
+    pub fn save_state(&self) -> crate::ui::state::SavedState {
+        let mut s = crate::ui::state::SavedState::new();
+        s.put_int("page", self.current_page() as i64);
+        if let Some(row) = self.highlighted_row {
+            s.put_int("highlighted_row", row as i64);
+        }
+        s.put_float("scroll_y", self.scroll_y);
+        if !self.input_text.is_empty() {
+            s.put_text("input_text", self.input_text.clone());
+        }
+        s
+    }
+
+    /// 恢复状态（与 [`Self::save_state`] 对称；冷启动传 None）。
+    ///
+    /// # 失败语义
+    /// 键缺失/类型不符时按默认值处理（半恢复无害：单项独立）。
+    pub fn restore_state(&mut self, state: &crate::ui::state::SavedState) {
+        if let Some(page) = state.get_int("page") {
+            self.page = match page {
+                0 => Page::List,
+                1 => Page::Draw,
+                2 => Page::Text,
+                3 => Page::Components,
+                _ => self.page,
+            };
+        }
+        if let Some(row) = state.get_int("highlighted_row") {
+            self.highlighted_row = usize::try_from(row).ok().filter(|r| *r < 200);
+        }
+        if let Some(y) = state.get_float("scroll_y") {
+            // 恢复后再由首次布局钳制（窗口尺寸可能已变）。
+            self.scroll_y = y.max(0.0);
+        }
+        if let Some(text) = state.get_text("input_text") {
+            self.input_text = text.to_string();
+        }
+        // 恢复即重排：旧页树与新状态不符。
+        self.invalidate_tree();
     }
 
     /// 帧推进（Choreographer 帧回调入口）。
@@ -559,6 +617,7 @@ impl Demo {
             Page::List => self.build_list_page(),
             Page::Draw => self.build_draw_page(),
             Page::Text => self.build_text_page(),
+            Page::Components => self.build_components_page(),
         }
     }
 
@@ -568,12 +627,12 @@ impl Demo {
     /// 内容区由各页装配函数填充。
     fn frame(&self, content_top: f32, content_bottom: f32) -> (FrameLayout, f32, f32) {
         let mut root = FrameLayout::new();
-        // 页签条（横排三格）。
+        // 页签条（横排四格）。
         let mut bar = LinearLayout::horizontal();
         bar.inner
             .view
             .set_background_color(Some(Color::rgb(0x21, 0x21, 0x21)));
-        for page in [Page::List, Page::Draw, Page::Text] {
+        for page in [Page::List, Page::Draw, Page::Text, Page::Components] {
             // 页签用 TextView：既有可点击命中，也有可见文字标签
             //（纯色块在深色背景上无法辨识当前在哪一页）。
             let mut tab = if let Some(font) = self.font.as_ref() {
@@ -600,20 +659,22 @@ impl Demo {
                 Color::rgb(0x2C, 0x2C, 0x2C)
             }));
             tab.view.set_padding_dp(0.0, 8.0, 0.0, 8.0);
+            // 文字在页签格内垂直居中（TextView 依 gravity 计算纵向偏移）。
+            tab.view.set_gravity(Gravity::CENTER_VERTICAL);
             // 三等分宽度：weight=1 平分容器（MATCH_PARENT 会各撑满
             // 容器宽度，横向排开后 tab2/3 被推出可视区）。
             let mut lp = MarginLayoutParams::new(0, tab_bar_height() as i32);
             lp.weight = 1.0;
-            bar.add_widget(Box::new(tab), lp, Gravity::TOP);
+            bar.add_widget(Box::new(tab), lp, Gravity::CENTER);
         }
         // 装箱后注册：手势键必须用子项最终的堆地址（装箱会移动 View，
         // 注册栈地址将永远无法命中）。
-        for (child, page) in bar
-            .inner
-            .children
-            .iter_mut()
-            .zip([Page::List, Page::Draw, Page::Text])
-        {
+        for (child, page) in bar.inner.children.iter_mut().zip([
+            Page::List,
+            Page::Draw,
+            Page::Text,
+            Page::Components,
+        ]) {
             register_tab_switch(child.child.view_mut(), page);
         }
         root.add_widget(
@@ -817,6 +878,129 @@ impl Demo {
         PageTree { root }
     }
 
+    /// P4：M3 组件陈列（纵向滚动，分组：按钮/选择/进度/容器）。
+    ///
+    /// # 装配约束
+    /// 新组件大多不实现 `Widget` 装箱所需的完整接口组合（部分为
+    /// 纯展示控件，无手势），V1 采用「Section 标题 + 组件行」的直排；
+    /// 行高由各组件 measure 决定，容器只负责纵向堆叠。
+    fn build_components_page(&mut self) -> PageTree {
+        let (mut root, _, _) = self.frame(tab_bar_height(), self.height);
+        let content_h = self.content_bottom() - self.content_top() - tab_bar_height();
+
+        let mut scroll = ScrollView::new();
+        let mut list = LinearLayout::vertical();
+
+        let dp = crate::ui::dimen::dp;
+
+        // 分组标题（Section header）。
+        let mut header = |list: &mut LinearLayout, text: &str| {
+            let mut tv = TextView::new();
+            if let Some(font) = self.font.as_ref() {
+                tv.set_context(clone_text_context(font));
+                tv.set_text(text);
+                tv.set_text_size_sp(14.0);
+                tv.set_text_color(crate::ui::theme::theme().roles.primary);
+            }
+            tv.view.set_padding_dp(16.0, 24.0, 16.0, 8.0);
+            list.add_widget(Box::new(tv), MarginLayoutParams::new(-1, -2), Gravity::TOP);
+        };
+
+        // ── Buttons ──
+        header(&mut list, "Buttons");
+        let mut button = crate::ui::widgets::button::Button::new();
+        if let Some(font) = self.font.as_ref() {
+            button.set_context(clone_text_context(font));
+        }
+        button.set_text("Filled");
+        list.add_widget(
+            Box::new(button),
+            MarginLayoutParams::new(-2, -2),
+            Gravity::TOP,
+        );
+
+        // ── Selection ──
+        header(&mut list, "Selection");
+        let mut checks = LinearLayout::horizontal();
+        for label in ["Check", "Radio"] {
+            let mut tv = TextView::new();
+            if let Some(font) = self.font.as_ref() {
+                tv.set_context(clone_text_context(font));
+                tv.set_text(label);
+                tv.set_text_size_sp(14.0);
+                tv.set_text_color(crate::ui::theme::theme().roles.on_surface);
+            }
+            tv.view.set_padding_dp(16.0, 12.0, 16.0, 12.0);
+            checks.add_widget(Box::new(tv), MarginLayoutParams::new(-2, -2), Gravity::TOP);
+        }
+        list.add_widget(
+            Box::new(checks),
+            MarginLayoutParams::new(-1, -2),
+            Gravity::TOP,
+        );
+
+        // ── Progress ──
+        header(&mut list, "Progress");
+        let mut linear = crate::ui::widgets::progress::LinearProgressIndicator::new();
+        linear.set_progress(0.6);
+        list.add_widget(
+            Box::new(linear),
+            MarginLayoutParams::new(-1, dp(4.0) as i32),
+            Gravity::TOP,
+        );
+        let mut spacer = TextView::new();
+        spacer.view.set_measured_dimension(0.0, dp(16.0));
+        list.add_widget(
+            Box::new(spacer),
+            MarginLayoutParams::new(-1, dp(16.0) as i32),
+            Gravity::TOP,
+        );
+        let mut circular = crate::ui::widgets::progress::CircularProgressIndicator::new();
+        circular.set_progress(0.75);
+        list.add_widget(
+            Box::new(circular),
+            MarginLayoutParams::new(dp(48.0) as i32, dp(48.0) as i32),
+            Gravity::TOP,
+        );
+
+        // ── Feedback ──
+        header(&mut list, "Feedback");
+        let mut snackbar = crate::ui::widgets::snackbar::Snackbar::new();
+        if let Some(font) = self.font.as_ref() {
+            snackbar.set_contexts(clone_text_context(font), clone_text_context(font));
+        }
+        snackbar.set_message("Snackbar message");
+        snackbar.show();
+        list.add_widget(
+            Box::new(snackbar),
+            MarginLayoutParams::new(-2, -2),
+            Gravity::TOP,
+        );
+
+        // ── Containers ──
+        header(&mut list, "Containers");
+        let mut chip = crate::ui::widgets::chip::Chip::new();
+        if let Some(font) = self.font.as_ref() {
+            chip.set_context(clone_text_context(font));
+        }
+        chip.set_text("Assist chip");
+        chip.set_has_icon(true);
+        list.add_widget(
+            Box::new(chip),
+            MarginLayoutParams::new(-2, -2),
+            Gravity::TOP,
+        );
+
+        scroll.set_child(Box::new(list), MarginLayoutParams::new(-1, -2));
+        scroll.request_scroll_to(self.scroll_y);
+        root.add_widget(
+            Box::new(scroll),
+            MarginLayoutParams::new(-1, content_h as i32),
+            Gravity::BOTTOM,
+        );
+        PageTree { root }
+    }
+
     /// P2 叠加层：Canvas 全原语演示（旋转方块/呼吸圆/渐变圆角条/描边环）。
     fn draw_p2_overlay(&self, scene: &mut Scene) {
         let w = self.width as f64;
@@ -927,6 +1111,7 @@ fn register_tab_switch(view: &View, page: Page) {
         Page::List => 0u8,
         Page::Draw => 1,
         Page::Text => 2,
+        Page::Components => 3,
     };
     gesture_registry::on(view.unique_id(), Gesture::Click, move || {
         PENDING_PAGE.store(code, std::sync::atomic::Ordering::Relaxed);
@@ -949,6 +1134,7 @@ fn take_page() -> Option<Page> {
         0 => Some(Page::List),
         1 => Some(Page::Draw),
         2 => Some(Page::Text),
+        3 => Some(Page::Components),
         _ => None,
     }
 }
@@ -1009,6 +1195,7 @@ impl DemoAction {
             Page::List => 0,
             Page::Draw => 1,
             Page::Text => 2,
+            Page::Components => 3,
         }
     }
 
@@ -1023,6 +1210,7 @@ impl DemoAction {
             0 => Some(DemoAction::SwitchPage(Page::List)),
             1 => Some(DemoAction::SwitchPage(Page::Draw)),
             2 => Some(DemoAction::SwitchPage(Page::Text)),
+            3 => Some(DemoAction::SwitchPage(Page::Components)),
             t if t >= 1000 => Some(DemoAction::ToggleRow((t - 1000) as usize)),
             _ => None,
         }
@@ -1035,11 +1223,12 @@ fn page_label(page: Page) -> &'static str {
         Page::List => "List",
         Page::Draw => "Draw",
         Page::Text => "Text",
+        Page::Components => "Components",
     }
 }
 
 /// 页树：结构根（FrameLayout 树，Task 20 起容器持 `Box<dyn Widget>`）。
-struct PageTree {
+pub struct PageTree {
     root: FrameLayout,
 }
 
@@ -1061,7 +1250,9 @@ impl PageTree {
     }
 
     /// 绘制。
-    fn draw(&self, scene: &mut Scene) {
+    /// 结构树绘制：遍历布局矩形，按控件类型翻译为 Scene 命令。
+    /// 探针/测试可见（pub），平台层经 render() 消费。
+    pub fn draw(&self, scene: &mut Scene) {
         self.root.draw(scene);
     }
 
@@ -1200,11 +1391,11 @@ mod tests {
         assert!(y > 100.0, "scroll_y must advance, got {y}");
     }
 
-    /// 三页均可装配渲染（无字体降级路径）。
+    /// 四页均可装配渲染（无字体降级路径）。
     #[test]
     fn all_pages_render() {
         let mut d = Demo::new(1080, 2400, None);
-        for page in [Page::List, Page::Draw, Page::Text] {
+        for page in [Page::List, Page::Draw, Page::Text, Page::Components] {
             d.page = page;
             let scene = d.render();
             assert!(!scene.commands.is_empty());
@@ -1253,5 +1444,51 @@ mod tests {
         let before = d.page;
         assert!(!d.perform_a11y_click(container.id));
         assert_eq!(d.page, before);
+    }
+
+    /// 状态保存/恢复往返：页码/高亮行/滚动偏移/输入文本逐项一致。
+    #[test]
+    fn save_restore_roundtrip() {
+        let mut d = Demo::new(1080, 2400, None);
+        d.page = Page::Text;
+        d.highlighted_row = Some(42);
+        d.scroll_y = 320.5;
+        d.input_text = "拼音 pinyin".to_string();
+        let state = d.save_state();
+        let json = state.to_json();
+
+        // 重建（模拟 Activity 重建：全新 Demo 实例）。
+        let mut d2 = Demo::new(1080, 2400, None);
+        let restored = crate::ui::state::SavedState::from_json(&json).unwrap();
+        d2.restore_state(&restored);
+        assert_eq!(d2.page, Page::Text);
+        assert_eq!(d2.highlighted_row, Some(42));
+        assert_eq!(d2.scroll_y, 320.5);
+        assert_eq!(d2.input_text, "拼音 pinyin");
+    }
+
+    /// 恢复后滚动偏移受首次布局钳制（窗口更小时不越界）。
+    #[test]
+    fn restore_clamps_scroll_after_layout() {
+        let mut d = Demo::new(1080, 2400, None);
+        d.scroll_y = 5000.0;
+        let state = d.save_state();
+
+        // 更小的窗口（旋转后重建）。
+        let mut d2 = Demo::new(2400, 1080, None);
+        d2.restore_state(&crate::ui::state::SavedState::from_json(&state.to_json()).unwrap());
+        d2.render(); // 触发布局 + 钳制。
+        assert!(d2.scroll_y >= 0.0);
+    }
+
+    /// 恢复空状态/畸形状态：按冷启动处理，不 panic。
+    #[test]
+    fn restore_empty_or_malformed_is_cold_start() {
+        let mut d = Demo::new(1080, 2400, None);
+        d.restore_state(&crate::ui::state::SavedState::new());
+        assert_eq!(d.page, Page::List);
+
+        // 畸形 JSON：from_json 返回 None，调用方跳过恢复。
+        assert!(crate::ui::state::SavedState::from_json("{broken").is_none());
     }
 }

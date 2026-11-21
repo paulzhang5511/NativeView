@@ -17,6 +17,24 @@ use parley::{FontContext, LayoutContext};
 
 use super::font::FontData;
 
+/// `&'static [u8]` 的 `AsRef` 包装：让 mmap 字体切片可零拷贝注入 `Blob`。
+struct StaticSlice(&'static [u8]);
+
+impl AsRef<[u8]> for StaticSlice {
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+/// `Arc<[u8]>` 的 `AsRef` 包装：堆字体缓冲零拷贝转发（不 `to_vec` 复制）。
+struct HeapSlice(Arc<[u8]>);
+
+impl AsRef<[u8]> for HeapSlice {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// 排版上下文：跨布局复用的字体缓存与样式表（非 Send；单线程 owning）。
 pub struct TextContext {
     /// parley 字体上下文（skrifa 解析 + 字形缓存宿主）。
@@ -84,9 +102,11 @@ impl TextContext {
     pub fn new(font: &FontData) -> Self {
         let mut font_cx = FontContext::new();
         // 注册字体数据：Blob 引用共享（零拷贝，与 FontData 同一份内存）。
-        let bytes: Arc<Vec<u8>> = match font.shared() {
-            super::font::FontBytes::Heap(arc) => Arc::new(arc.as_ref().to_vec()),
-            super::font::FontBytes::Mmap(slice) => Arc::new(slice.to_vec()),
+        // 堆缓冲直接 Arc 转发；mmap 静态切片包一层借用包装（同样零拷贝），
+        // 避免 200 行列表页各自复制 14MB 字体导致 ~2.9GB RSS。
+        let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> = match font.shared() {
+            super::font::FontBytes::Heap(arc) => Arc::new(HeapSlice(arc)),
+            super::font::FontBytes::Mmap(slice) => Arc::new(StaticSlice(slice)),
         };
         font_cx.collection.register_fonts(Blob::new(bytes), None);
         Self {

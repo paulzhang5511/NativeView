@@ -27,7 +27,7 @@ impl VelloGpuBackend {
 
 #[cfg(target_os = "android")]
 impl Backend for VelloGpuBackend {
-    fn render_frame(&mut self, scene: &Scene) -> Result<(), ()> {
+    fn render_frame(&mut self, mut scene: Scene) -> Result<(), ()> {
         // V1：软件光栅化 → 纹理上传 → blit（命令级 GPU 管线归 V2）。
         render_pixmap_frame(&mut self.base, scene)
     }

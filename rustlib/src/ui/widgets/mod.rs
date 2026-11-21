@@ -1,18 +1,57 @@
-//! 内置控件：FrameLayout / LinearLayout / ScrollView / TextView /
-//! EditText / ImageView / Button（PRD §5.1.7，Task 16/23）。
+//! 内置控件（M3 Expressive 全量组件库）。
 
+pub mod badge;
+pub mod bottom_sheet;
 pub mod button;
+pub mod card;
+pub mod checkbox;
+pub mod chip;
+pub mod date_picker;
+pub mod dialog;
+pub mod divider;
 pub mod edit_text;
+pub mod fab;
 pub mod image_view;
 pub mod layout;
+pub mod list_item;
+pub mod navigation_bar;
+pub mod progress;
+pub mod radio_button;
 pub mod scroll_view;
+pub mod search_bar;
+pub mod slider;
+pub mod snackbar;
+pub mod switch;
+pub mod tab_row;
+pub mod text_field;
 pub mod text_view;
+pub mod time_picker;
+pub mod tooltip;
 pub mod widget;
 
-pub use button::Button;
+pub use badge::Badge;
+pub use bottom_sheet::BottomSheet;
+pub use button::{Button, ButtonVariant};
+pub use card::Card;
+pub use checkbox::Checkbox;
+pub use chip::Chip;
+pub use date_picker::DatePicker;
+pub use dialog::Dialog;
+pub use divider::Divider;
 pub use edit_text::EditText;
+pub use fab::Fab;
 pub use image_view::{ImageView, ScaleType};
 pub use layout::{FrameLayout, LinearLayout, Orientation, ViewWidget};
+pub use list_item::{ListItem, ListLines};
+pub use navigation_bar::NavigationBar;
+pub use progress::{CircularProgressIndicator, LinearProgressIndicator};
 pub use scroll_view::ScrollView;
+pub use search_bar::SearchBar;
+pub use slider::Slider;
+pub use snackbar::Snackbar;
+pub use tab_row::TabRow;
+pub use text_field::TextField;
 pub use text_view::{Ellipsize, TextAlignment, TextView};
+pub use time_picker::TimePicker;
+pub use tooltip::Tooltip;
 pub use widget::Widget;

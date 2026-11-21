@@ -1,0 +1,12 @@
+# 默认交叉编译到 Android aarch64：
+# 日常 `cargo build` / `cargo check` 直接产出 arm64 产物，无需显式 -t；
+# host 侧 `cargo test` 需显式 `--target x86_64-pc-windows-msvc`（或临时清空此配置），
+# 否则测试产物为 Android 目标无法在 Windows 上运行。
+[build]
+target = "aarch64-linux-android"
+
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

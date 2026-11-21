@@ -1,0 +1,8 @@
+# Project-specific R8 rules.
+# JNI 只按名字调用这些 Kotlin 成员（Rust 侧 call_method），R8 无法看到
+# 调用边，必须整类保留，否则 release 包 IME/无障碍链路会被裁剪。
+
+-keep class com.nativeview.app.MyNativeActivity { *; }
+-keep class com.nativeview.app.ImeBridge { *; }
+-keep class com.nativeview.app.A11yBridge { *; }
+-keepclassmembers class com.nativeview.app.A11yBridge$Node { *; }

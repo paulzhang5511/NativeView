@@ -1,0 +1,59 @@
+[package]
+name = "velloview"
+version = "0.1.0"
+edition = "2024"
+description = "NativeView：纯原生 Android 视图框架（Rust 实现）"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[features]
+# 默认：CPU 后端 + 文字栈。裸 `cargo build` / `cargo test` 即可工作。
+default = ["cpu", "text"]
+
+# 各后端 feature 只负责"编译进哪个引擎"，不隐含文字能力。
+# cpu 后端走 vello_cpu 的 u8 管线（速度优先，与 A7 黄金图容差相容）。
+cpu = ["dep:vello_cpu", "vello_cpu/u8_pipeline", "vello_cpu/png"]
+
+# GPU 预处理后端：wgpu 仅 Vulkan。绝不允许出现 "gles" ——
+# 它会把 ndk-sys 拉进依赖树（PRD §6.4.5 实测），违反手写 FFI 约束。
+vello_gpu = ["dep:vello_gpu", "dep:wgpu", "dep:vello_common", "vello_gpu/wgpu", "wgpu/vulkan", "wgpu/wgsl"]
+
+# 全 GPU 管线后端：依赖 Vulkan 1.1+。
+vello = ["dep:vello", "dep:wgpu", "vello/wgpu", "wgpu/vulkan", "wgpu/wgsl"]
+
+# 文字栈：parley 排版 + skrifa 解析；字形光栅化交由"当前已启用的后端"完成，
+# 因此每启用一种后端，text feature 会自动把该后端的 text 能力打开。
+text = ["dep:parley", "dep:glifo", "dep:skrifa", "vello_cpu?/text", "vello_gpu?/text"]
+
+[dependencies]
+# wgpu 由本仓库统一收敛 feature：显式关闭默认集，只保留 vulkan + wgsl。
+# 关键：绝不允许出现 "gles" —— 它会把 ndk-sys 拉进依赖树（PRD §6.4.5 实测）。
+wgpu = { version = "30.0", optional = true, default-features = false, features = ["std"] }
+
+vello = { version = "0.12", optional = true, default-features = false }
+vello_gpu = { version = "0.4", optional = true, default-features = false, features = ["std", "full_image_support", "gradient_sweep"] }
+vello_cpu = { version = "0.4", optional = true, default-features = false, features = ["std", "u8_pipeline", "png"] }
+# vello_common 为 vello_gpu/vello_cpu 共享类型层（Paint/Rect 等），
+# 由 vello_gpu 依赖传递引入，此处显式声明以直接引用其类型。
+vello_common = { version = "0.4", optional = true, default-features = false, features = ["std"] }
+
+parley = { version = "0.11", optional = true, default-features = false, features = ["std", "complex-scripts"] }
+glifo = { version = "0.5", optional = true, default-features = false, features = ["std"] }
+skrifa = { version = "0.49", optional = true, default-features = false, features = ["std"] }
+
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+raw-window-handle = "0.6"
+log = "0.4"
+# 阻塞执行 wgpu future（Android 无异步运行时；桌面/真机均可用）
+pollster = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# 仅允许的第三方 Android 绑定 crate（PRD §6.4.1）；NDK API 一律手写 FFI。
+jni = "0.22.4"
+# 仅 Android：mmap/close 系统调用（字体零拷贝加载，PRD §5.1.4）。
+libc = "0.2"
+
+[dev-dependencies]
+# 主机侧日志后端；不引入任何 android 相关 crate
+env_logger = "0.11"

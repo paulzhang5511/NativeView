@@ -1,0 +1,21 @@
+*.iml
+.gradle
+/local.properties
+.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+.kotlin
+target
+android-37.2
+.book
+*.so
+app/src/main/jniLibs/
+rustlib/jniLibs/
+
+# 内部文档不随仓库发布（README 作为仓库门面保留）
+*.md
+!README.md

@@ -109,6 +109,225 @@ impl FrameTrace {
     }
 }
 
+/// 后端内部子阶段索引（`STAGE_RENDER` 的进一步分解）。
+///
+/// # 为什么要细拆
+/// `render` 段包含「软件光栅 → 像素搬运/纹理上传 → 提交呈现」三件事，
+/// 优化方向完全不同（前者吃 CPU、后者吃带宽/驱动）。只测总时长会把
+/// 两者混成一个数字，无法判断该并行光栅还是该减少上传。
+pub const SUB_RASTER: usize = 0;
+pub const SUB_UPLOAD: usize = 1;
+pub const SUB_PRESENT: usize = 2;
+pub const SUB_ACQUIRE: usize = 3;
+pub const SUB_IMAGE: usize = 4;
+pub const SUB_COUNT: usize = 5;
+/// 子阶段名（日志用，固定英文）。
+pub const SUB_NAMES: [&str; SUB_COUNT] = ["raster", "upload", "present", "acquire", "image"];
+
+/// 最近一帧各子阶段耗时（µs）。后端在帧内写、统计器在帧末读。
+///
+/// # `acquire` 为什么要单列
+/// `get_current_texture` 在 FIFO 队列里会**阻塞等待 vsync 空位**，它测出来的是
+/// 「等屏幕」的时长，不是本帧的计算成本。与光栅/上传混在一起会让帧成本虚高
+/// （实测把 6ms 的帧报成 16ms），从而误判「已到 60fps 上限」。
+static SUB_US: [AtomicU64; SUB_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// 每帧转成预乘的像素数（诊断用：判断增量路径是否真的只算了一小块）。
+static PREMUL_PIXELS: AtomicU64 = AtomicU64::new(0);
+
+/// 累加本帧转换的像素数。
+pub fn add_premul_pixels(n: u64) {
+    PREMUL_PIXELS.fetch_add(n, Ordering::Relaxed);
+}
+
+/// 读取并清零本帧像素数（每帧只应被读一次，由帧统计取走）。
+pub fn take_premul_pixels() -> u64 {
+    PREMUL_PIXELS.swap(0, Ordering::Relaxed)
+}
+
+/// 记录某子阶段耗时（后端内部调用，无锁写）。
+pub fn record_sub_us(idx: usize, dur: std::time::Duration) {
+    if idx < SUB_COUNT {
+        SUB_US[idx].store(dur.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// 累加型子阶段耗时（一帧内可能发生多次，如多张图片预乘）。
+pub fn add_sub_us(idx: usize, dur: std::time::Duration) {
+    if idx < SUB_COUNT {
+        SUB_US[idx].fetch_add(dur.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// 清零某个累加型子阶段（帧首调用）。
+pub fn reset_sub(idx: usize) {
+    if idx < SUB_COUNT {
+        SUB_US[idx].store(0, Ordering::Relaxed);
+    }
+}
+
+/// 读取最近一帧的子阶段耗时快照。
+pub fn sub_us() -> [u64; SUB_COUNT] {
+    std::array::from_fn(|i| SUB_US[i].load(Ordering::Relaxed))
+}
+
+/// 帧呈现模式的计数器（基准验收用：确认「局部重绘」真的生效）。
+///
+/// # 为什么要有它
+/// 脏区是否命中完全取决于上层声明与后端条件之间的对齐，做错了也不报错——
+/// 只会静默地退化成整帧重绘。基准必须能直接看到「这一轮有多少帧走了局部路径」，
+/// 否则优化等于没有证据。
+// 整帧兜底原因（落笔帧没能局部化的定性统计）。
+pub const DAMAGE_NONE: usize = 0;
+pub const DAMAGE_SCREEN: usize = 1;
+pub const DAMAGE_PAGE_SHIFT: usize = 2;
+pub const DAMAGE_SHEET: usize = 3;
+pub const DAMAGE_PRESS: usize = 4;
+pub const DAMAGE_TOAST: usize = 5;
+pub const DAMAGE_DRAG: usize = 6;
+pub const DAMAGE_FLASH: usize = 7;
+pub const DAMAGE_REV_MISMATCH: usize = 8;
+pub const DAMAGE_REASON_COUNT: usize = 9;
+pub const DAMAGE_REASON_NAMES: [&str; DAMAGE_REASON_COUNT] = [
+    "ok",
+    "screen",
+    "page_shift",
+    "sheet",
+    "press",
+    "toast",
+    "drag",
+    "flash",
+    "rev_mismatch",
+];
+static DAMAGE_REASON: [AtomicU64; DAMAGE_REASON_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// 记一次「落笔帧整帧兜底」的定性原因。
+pub fn note_damage_reason(idx: usize) {
+    if idx < DAMAGE_REASON_COUNT {
+        DAMAGE_REASON[idx].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 读取并清零整帧兜底原因计数。
+pub fn take_damage_reasons() -> [u64; DAMAGE_REASON_COUNT] {
+    std::array::from_fn(|i| DAMAGE_REASON[i].swap(0, Ordering::Relaxed))
+}
+
+/// 已呈现帧的单调序号（同帧内判断「本帧是否已经出过帧」）。
+static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
+static MODE_PARTIAL: AtomicU64 = AtomicU64::new(0);
+static MODE_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// 记录一帧的上屏模式（局部 / 整帧）。
+/// 读取已呈现帧序号。
+pub fn frame_seq() -> u64 {
+    FRAME_SEQ.load(Ordering::Acquire)
+}
+
+/// 记一帧已呈现（推进帧序号）。
+pub fn bump_frame_seq() {
+    FRAME_SEQ.fetch_add(1, Ordering::Release);
+}
+
+pub fn note_frame_mode(partial: bool) {
+    bump_frame_seq();
+    if partial {
+        MODE_PARTIAL.fetch_add(1, Ordering::Relaxed);
+    } else {
+        MODE_FULL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 读取并清零模式计数，返回 `(局部帧数, 整帧数)`。
+pub fn take_frame_modes() -> (u64, u64) {
+    (
+        MODE_PARTIAL.swap(0, Ordering::Relaxed),
+        MODE_FULL.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// build 段内部耗时分解（`STAGE_BUILD` 的进一步分解）。
+///
+/// # 为什么要拆
+/// build 里既有「重建画板预览位图」这种像素级工作，也有「重新排版文字」这种
+/// 字形级工作，两者优化手段完全不同（前者做增量更新，后者做布局缓存）。
+pub const BUILD_SUB_PREVIEW: usize = 0;
+pub const BUILD_SUB_TEXT: usize = 1;
+pub const BUILD_SUB_INPUT: usize = 2;
+pub const BUILD_SUB_ADVANCE: usize = 3;
+pub const BUILD_SUB_SCENE: usize = 4;
+pub const BUILD_SUB_TREE: usize = 5;
+pub const BUILD_SUB_INK: usize = 6;
+pub const BUILD_SUB_DOCVIEW: usize = 7;
+pub const BUILD_SUB_MERGE: usize = 8;
+pub const BUILD_SUB_RESIZE: usize = 9;
+pub const BUILD_SUB_TREE_DRAW: usize = 10;
+pub const BUILD_SUB_COUNT: usize = 11;
+/// build 子阶段名（日志用）。
+pub const BUILD_SUB_NAMES: [&str; BUILD_SUB_COUNT] = [
+    "preview",
+    "text",
+    "input",
+    "advance",
+    "scene",
+    "tree",
+    "ink",
+    "docview",
+    "merge",
+    "resize",
+    "tree_draw",
+];
+
+/// 最近一帧 build 子阶段耗时（µs）。
+static BUILD_SUB_US: [AtomicU64; BUILD_SUB_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// 记录 build 子阶段耗时（跨多次调用累加，帧首清零）。
+pub fn add_build_sub_us(idx: usize, dur: std::time::Duration) {
+    if idx < BUILD_SUB_COUNT {
+        BUILD_SUB_US[idx].fetch_add(dur.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// 清零 build 子阶段累计（每帧构建前调用）。
+pub fn reset_build_sub() {
+    for v in BUILD_SUB_US.iter() {
+        v.store(0, Ordering::Relaxed);
+    }
+}
+
+/// 读取 build 子阶段耗时快照。
+pub fn build_sub_us() -> [u64; BUILD_SUB_COUNT] {
+    std::array::from_fn(|i| BUILD_SUB_US[i].load(Ordering::Relaxed))
+}
+
 /// FPS 统计窗口（最近 N 帧间隔；短窗口保证 fps 读数跟随当前帧率）。
 const FPS_WINDOW: usize = 30;
 
@@ -296,14 +515,20 @@ impl FrameStats {
                 self.render_times_ms.len()
             )
         };
+        // 子阶段（光栅/上传/呈现）读数：与帧间隔一起看，才能区分
+        // 「CPU 算得慢」还是「像素搬得多」。
+        let sub = sub_us();
         log::info!(
-            "frame stats #{}: n={} p50={}ms p95={}ms max={}ms fps={:.1}{}",
+            "frame stats #{}: n={} p50={}ms p95={}ms max={}ms fps={:.1} raster={}us upload={}us present={}us{}",
             self.batches,
             n,
             p50,
             p95,
             max,
             fps,
+            sub[SUB_RASTER],
+            sub[SUB_UPLOAD],
+            sub[SUB_PRESENT],
             budget_info
         );
     }

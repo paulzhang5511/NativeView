@@ -547,6 +547,9 @@ fn a11y_click_rejects_unknown_tag() {
 fn preview_cache_key_tracks_revision() {
     // 缩略图缓存必须按文档版本号失效，不能只看像素指针。
     let mut ink = bare_ink();
+    // 与 `Demo::render` 一致：先按窗口尺寸同步视口，否则画板矩形高为 0，
+    // 预览会被压成几十像素的缩略图，测不到真实链路。
+    ink.resize(1080.0, 2400.0, 80.0, 100.0);
     ink.screen = Screen::NewCanvas;
     ink.perform(Action::StartDrawing);
     ink.screen = Screen::Board;
@@ -572,6 +575,40 @@ fn preview_cache_key_tracks_revision() {
         ink.preview.as_ref().expect("preview rebuilt").0,
         rev1,
         "preview cache must follow revision"
+    );
+}
+
+#[test]
+fn board_preview_shows_new_strokes() {
+    // 零拷贝预览路径（直接借用图层像素 + 就地补丁）必须把新笔迹真的画进预览图：
+    // 任一环节（借用错层 / 补丁落错位 / 键判断错）都会让画板"看着像没画"。
+    let mut ink = bare_ink();
+    // 与 `Demo::render` 一致：先按窗口尺寸同步视口，否则画板矩形高为 0，
+    // 预览会被压成几十像素的缩略图，测不到真实链路。
+    ink.resize(1080.0, 2400.0, 80.0, 100.0);
+    ink.screen = Screen::NewCanvas;
+    ink.perform(Action::StartDrawing);
+    ink.screen = Screen::Board;
+    let mut scene = Scene::new(1080, 2400);
+    ink.render(&mut scene);
+
+    if let Some(doc) = ink.doc.as_mut() {
+        doc.brush = PRESETS[0].brush;
+        doc.begin_live();
+        doc.extend_live(&[
+            StrokePoint::new(200.0, 200.0, 1.0, 0),
+            StrokePoint::new(500.0, 600.0, 1.0, 50),
+            StrokePoint::new(800.0, 1000.0, 1.0, 100),
+        ]);
+        doc.end_live();
+    }
+    let mut scene2 = Scene::new(1080, 2400);
+    ink.render(&mut scene2);
+    let img = &ink.preview.as_ref().expect("preview built").3;
+    let painted = img.pixels().chunks(4).filter(|p| p[3] > 0).count();
+    assert!(
+        painted > 500,
+        "preview must contain the stroke, opaque pixels={painted}"
     );
 }
 

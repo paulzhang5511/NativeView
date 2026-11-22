@@ -41,6 +41,58 @@ pub struct TextContext {
     font_cx: FontContext,
     /// parley 排版上下文（样式表 + 断行游标缓存）。
     layout_cx: LayoutContext<ColorBrush>,
+    /// 排版结果缓存：同一段文字 + 同样式重复请求时直接复用。
+    ///
+    /// # 为什么必须有
+    /// parley 的 `build + break_all_lines + align` 单次 0.2–0.5ms（要断行、
+    /// 取字形、算 cluster）。一个页面十几段文字、每帧都排一次，实测能吃掉
+    /// 4–5ms —— 帧预算才 16.7ms。文案与样式都没变时这部分工作本可为零。
+    ///
+    /// # 失效策略
+    /// 键包含文字、字号、限宽、对齐与颜色，任一变化自然落到新条目；
+    /// 容量上限按「最久未用」淘汰，防止动态数值文案（字数/百分比）无限增长。
+    cache: std::cell::RefCell<LayoutCache>,
+}
+
+/// 排版缓存的最大条目数（一屏文字约 20–40 段，留一倍余量给动画中间文案）。
+const LAYOUT_CACHE_CAP: usize = 96;
+
+/// 排版缓存的键：文字 + 字号 + 限宽 + 对齐 + 颜色。
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LayoutKey {
+    text: String,
+    size_bits: u32,
+    max_adv_bits: u32,
+    align: u8,
+    rgba: [u8; 4],
+}
+
+/// 排版缓存本体（顺序表实现：容量极小，线性查找比哈希更省事且无额外分配）。
+struct LayoutCache {
+    entries: std::collections::VecDeque<(LayoutKey, std::rc::Rc<TextLayout>)>,
+}
+
+impl LayoutCache {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &LayoutKey) -> Option<std::rc::Rc<TextLayout>> {
+        let pos = self.entries.iter().position(|(k, _)| k == key)?;
+        let hit = self.entries.remove(pos)?;
+        let out = std::rc::Rc::clone(&hit.1);
+        self.entries.push_back(hit);
+        Some(out)
+    }
+
+    fn put(&mut self, key: LayoutKey, layout: std::rc::Rc<TextLayout>) {
+        if self.entries.len() >= LAYOUT_CACHE_CAP {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, layout));
+    }
 }
 
 /// parley Brush 实现：纯色（V1 无渐变文字）。
@@ -112,6 +164,7 @@ impl TextContext {
         Self {
             font_cx,
             layout_cx: LayoutContext::new(),
+            cache: std::cell::RefCell::new(LayoutCache::new()),
         }
     }
 
@@ -119,9 +172,23 @@ impl TextContext {
     ///
     /// # 返回
     /// `None` 仅当文本为空（零行布局无意义）。
-    pub fn layout(&mut self, req: &TextStyleRequest<'_>) -> Option<TextLayout> {
+    pub fn layout(&mut self, req: &TextStyleRequest<'_>) -> Option<std::rc::Rc<TextLayout>> {
         if req.text.is_empty() {
             return None;
+        }
+        let key = LayoutKey {
+            text: req.text.to_string(),
+            size_bits: req.font_size.to_bits(),
+            max_adv_bits: req.max_advance.unwrap_or(f32::NAN).to_bits(),
+            align: match req.align {
+                TextAlign::Left => 0,
+                TextAlign::Center => 1,
+                TextAlign::Right => 2,
+            },
+            rgba: [req.color.r, req.color.g, req.color.b, req.color.a],
+        };
+        if let Some(hit) = self.cache.borrow_mut().get(&key) {
+            return Some(hit);
         }
         let brush = ColorBrush {
             rgba: [req.color.r, req.color.g, req.color.b, req.color.a],
@@ -152,10 +219,12 @@ impl TextContext {
             },
             AlignmentOptions::default(),
         );
-        Some(TextLayout {
+        let out = std::rc::Rc::new(TextLayout {
             layout,
             font_size: req.font_size,
-        })
+        });
+        self.cache.borrow_mut().put(key, std::rc::Rc::clone(&out));
+        Some(out)
     }
 }
 
@@ -298,4 +367,91 @@ pub struct LineMetricsInfo {
     pub line_height: f32,
     /// 基线相对行顶的 y 偏移。
     pub baseline: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 排版缓存必须「同文案同样式命中、不同文案/字号不命中」。
+    ///
+    /// # 为什么这条要有单测
+    /// 缓存命中与否直接决定每帧 4–5ms 的开销；一旦键漏了某个样式维度
+    /// （字号/限宽/颜色），会出现「改字号但版式不更新」的诡异 bug。
+    #[test]
+    fn layout_cache_hits_on_identical_request() {
+        let font = crate::text::font::load_from_path(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../app/src/main/assets/fonts/NotoSerifSC-Regular.ttf"
+        )))
+        .expect("fixture font must load");
+        let mut cx = TextContext::new(&font);
+        let c = crate::gfx::color::Color {
+            r: 0x20,
+            g: 0x20,
+            b: 0x28,
+            a: 255,
+        };
+        let mut req = TextStyleRequest {
+            text: "鸢尾花 · 01",
+            font_size: 16.0,
+            max_advance: Some(300.0),
+            align: TextAlign::Left,
+            color: c,
+            line_spacing_multiplier: 1.25,
+        };
+        let a = cx.layout(&req).expect("layout");
+        let b = cx.layout(&req).expect("layout");
+        assert!(std::rc::Rc::ptr_eq(&a, &b), "同一请求必须命中同一条缓存");
+        assert_eq!(a.width(), b.width());
+        // 字号变化 → 必须是新条目（否则版式不会随字号更新）。
+        req.font_size = 18.0;
+        let d = cx.layout(&req).expect("layout");
+        assert!(!std::rc::Rc::ptr_eq(&a, &d));
+    }
+
+    /// 缓存容量必须封顶（动态数值文案不能无限堆积内存）。
+    #[test]
+    fn layout_cache_is_bounded() {
+        let font = crate::text::font::load_from_path(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../app/src/main/assets/fonts/NotoSerifSC-Regular.ttf"
+        )))
+        .expect("fixture font must load");
+        let mut cx = TextContext::new(&font);
+        for i in 0..(LAYOUT_CACHE_CAP + 10) {
+            let text = format!("{i}%");
+            let req = TextStyleRequest {
+                text: &text,
+                font_size: 12.0,
+                max_advance: Some(100.0),
+                align: TextAlign::Left,
+                color: crate::gfx::color::Color::TRANSPARENT,
+                line_spacing_multiplier: 1.2,
+            };
+            let _ = cx.layout(&req);
+        }
+        // 底层缓存同样封顶（避免只测到 TextContext 的薄封装）。
+        assert!(cx.cache.borrow().entries.len() <= LAYOUT_CACHE_CAP);
+    }
+
+    /// 空文案直接返回 None（不占缓存、不排版）。
+    #[test]
+    fn empty_text_returns_none() {
+        let font = crate::text::font::load_from_path(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../app/src/main/assets/fonts/NotoSerifSC-Regular.ttf"
+        )))
+        .expect("fixture font must load");
+        let mut cx = TextContext::new(&font);
+        let req = TextStyleRequest {
+            text: "",
+            font_size: 12.0,
+            max_advance: None,
+            align: TextAlign::Left,
+            color: crate::gfx::color::Color::TRANSPARENT,
+            line_spacing_multiplier: 1.2,
+        };
+        assert!(cx.layout(&req).is_none());
+    }
 }

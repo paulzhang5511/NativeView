@@ -45,7 +45,8 @@ pub struct TextView {
     /// 省略策略。
     ellipsize: Ellipsize,
     /// 排版缓存（measure 填充，draw 消费）。
-    layout: Option<TextLayout>,
+    /// 排版结果（`Rc` 共享：排版缓存命中时不复制 parley 布局）。
+    layout: Option<std::rc::Rc<TextLayout>>,
     /// 省略后的实际绘制文本（measure 填充）。
     display_text: String,
     /// 排版测量器（持有 `TextContext`，由 `set_context` 注入后可用）。
@@ -86,7 +87,7 @@ impl TextView {
 
     /// 排版缓存只读访问（供扩展控件复用已排版结果，避免二次排版）。
     pub fn layout_cache(&self) -> Option<&TextLayout> {
-        self.layout.as_ref()
+        self.layout.as_deref()
     }
 
     /// 设置字号。

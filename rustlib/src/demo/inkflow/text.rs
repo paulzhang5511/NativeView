@@ -35,9 +35,14 @@ impl Inkflow {
             color,
             line_spacing_multiplier: 1.25,
         };
+        let t = std::time::Instant::now();
         let Some(layout) = cx.layout(&req) else {
             return 0.0;
         };
+        crate::platform::perf::add_build_sub_us(
+            crate::platform::perf::BUILD_SUB_TEXT,
+            t.elapsed(),
+        );
         let w = layout.width();
         let ax = match align {
             TextAlign::Left => x as f64,
@@ -68,9 +73,14 @@ impl Inkflow {
             color,
             line_spacing_multiplier: 1.2,
         };
+        let t = std::time::Instant::now();
         let Some(layout) = cx.layout(&req) else {
             return;
         };
+        crate::platform::perf::add_build_sub_us(
+            crate::platform::perf::BUILD_SUB_TEXT,
+            t.elapsed(),
+        );
         let h = layout.height() as f64;
         let y = rect.y + ((rect.h - h) / 2.0).max(0.0);
         emit_layout(scene, &layout, rect.x, y);

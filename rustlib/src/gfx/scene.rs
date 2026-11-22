@@ -87,6 +87,16 @@ pub struct Scene {
     pub clear_color: Color,
     /// 有序命令列表。
     pub commands: Vec<Command>,
+    /// 作者声明的本帧脏区（`None` = 未知，后端按整帧处理）。
+    ///
+    /// # 语义
+    /// - `Some(rect)`：只有该矩形内像素可能变化，后端可只光栅/只上传该区域；
+    /// - `Some(空矩形)`：本帧画面没有任何变化，后端可以整帧跳过（不 acquire、
+    ///   不 present），静止页因此不消耗 vsync 与带宽。
+    ///
+    /// 由场景作者（demo）在「确定只有这块变了」时填写；宁可填 `None` 也
+    /// 不能多报小区域——后端据此不再校验其余像素，报小了会留下陈旧画面。
+    pub damage: Option<Rect>,
 }
 
 impl Scene {
@@ -97,6 +107,7 @@ impl Scene {
             height,
             clear_color: Color::TRANSPARENT,
             commands: Vec::new(),
+            damage: None,
         }
     }
 
@@ -116,6 +127,11 @@ impl Scene {
     pub fn translate(&mut self, dx: f64, dy: f64) {
         if dx == 0.0 && dy == 0.0 {
             return;
+        }
+        // 脏区与几何一起平移：调用方之后声明的脏矩形仍是同一坐标系。
+        if let Some(d) = self.damage.as_mut() {
+            d.x += dx;
+            d.y += dy;
         }
         for cmd in &mut self.commands {
             match cmd {

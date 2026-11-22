@@ -668,14 +668,30 @@ impl Demo {
     pub fn render(&mut self) -> Scene {
         let mut scene = Scene::new(self.width as u32, self.height as u32);
         scene.clear_color = Color::rgb(0x18, 0x18, 0x18);
-        self.tree_for_layout().draw(&mut scene);
+        let t_tree = std::time::Instant::now();
+        let tree = self.tree_for_layout();
+        crate::platform::perf::add_build_sub_us(
+            crate::platform::perf::BUILD_SUB_RESIZE,
+            t_tree.elapsed(),
+        );
+        let t_tree_draw = std::time::Instant::now();
+        tree.draw(&mut scene);
+        crate::platform::perf::add_build_sub_us(
+            crate::platform::perf::BUILD_SUB_TREE_DRAW,
+            t_tree_draw.elapsed(),
+        );
         // Inkflow 自绘层（与树无关，整页 Scene 直绘）。
         if self.page == Page::Inkflow {
+            let t_resize = std::time::Instant::now();
             self.ink.resize(
                 self.width,
                 self.height,
                 self.insets_top(),
                 self.insets_bottom(),
+            );
+            crate::platform::perf::add_build_sub_us(
+                crate::platform::perf::BUILD_SUB_RESIZE,
+                t_resize.elapsed(),
             );
             self.ink.render(&mut scene);
         }

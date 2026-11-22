@@ -13,7 +13,9 @@ default = ["cpu", "text"]
 
 # 各后端 feature 只负责"编译进哪个引擎"，不隐含文字能力。
 # cpu 后端走 vello_cpu 的 u8 管线（速度优先，与 A7 黄金图容差相容）。
-cpu = ["dep:vello_cpu", "vello_cpu/u8_pipeline", "vello_cpu/png"]
+# 多线程细光栅（vello_cpu/multithreading 走 rayon）：整帧光栅按 tile 分给多核，
+# 这是「一帧 1080×2400 <8ms」的主要手段。
+cpu = ["dep:vello_cpu", "vello_cpu/u8_pipeline", "vello_cpu/png", "vello_cpu/multithreading"]
 
 # GPU 预处理后端：wgpu 仅 Vulkan。绝不允许出现 "gles" ——
 # 它会把 ndk-sys 拉进依赖树（PRD §6.4.5 实测），违反手写 FFI 约束。

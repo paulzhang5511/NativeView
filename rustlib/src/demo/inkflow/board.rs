@@ -5,6 +5,7 @@
 
 use crate::gfx::canvas::Canvas;
 use crate::gfx::color::Color;
+use crate::gfx::image::Image;
 use crate::gfx::paint::Paint;
 use crate::gfx::scene::{Rect, Scene};
 use crate::paint::Document;
@@ -370,6 +371,90 @@ impl Inkflow {
             );
         }
     }
+    /// 声明本帧脏区：只在「画板静止 + 唯一变化是刚落下的一小段笔迹」时成立。
+    ///
+    /// # 为什么可以只报笔迹矩形
+    /// 该帧其余像素与上一帧逐位相同：没有页面/面板动效、没有按压高亮与脉冲、
+    /// 没有提示条与撤销闪烁，dock 与顶栏的数值本轮未变。因此后端只重绘这一块
+    /// 就是最终画面，不需要整屏校验。
+    ///
+    /// # 保守条件
+    /// 任一条件不满足就直接放弃声明（保持 `None` = 整帧），宁可多画一帧，
+    /// 也不冒「留下陈旧像素」的风险。`from_rev` 必须等于上一次出帧时的
+    /// revision，才能保证这中间没有别的帧改变过画面。
+    fn note_stroke_damage(
+        &mut self,
+        dirty: Option<(u32, (u32, u32, u32, u32))>,
+        ox: f64,
+        oy: f64,
+        k: f64,
+    ) {
+        // 诊断：整帧兜底的原因计数（只看有效的「落笔帧」为何没能局部化）。
+        if let Some((from_rev, _)) = dirty {
+            if from_rev == self.rendered_doc_rev {
+                let reason = if self.screen != Screen::Board {
+                    crate::platform::perf::DAMAGE_SCREEN
+                } else if self.page_shift().abs() > 0.01 {
+                    crate::platform::perf::DAMAGE_PAGE_SHIFT
+                } else if self.sheet_p() > 0.001 {
+                    crate::platform::perf::DAMAGE_SHEET
+                } else if self.press_fade() > 0.01 {
+                    crate::platform::perf::DAMAGE_PRESS
+                } else if self.toast_p() > 0.01 {
+                    crate::platform::perf::DAMAGE_TOAST
+                } else if self.drag.is_some() {
+                    crate::platform::perf::DAMAGE_DRAG
+                } else if self.flash_p() > 0.01 {
+                    crate::platform::perf::DAMAGE_FLASH
+                } else {
+                    crate::platform::perf::DAMAGE_NONE
+                };
+                crate::platform::perf::note_damage_reason(reason);
+            }
+        }
+        if self.screen != Screen::Board
+            || self.page_shift().abs() > 0.01
+            || self.sheet_p() > 0.001
+            || self.press_fade() > 0.01
+            || self.toast_p() > 0.01
+            || self.drag.is_some()
+            || self.flash_p() > 0.01
+        {
+            return;
+        }
+        let Some((from_rev, (x0, y0, x1, y1))) = dirty else {
+            return;
+        };
+        if from_rev != self.rendered_doc_rev {
+            crate::platform::perf::note_damage_reason(
+                crate::platform::perf::DAMAGE_REV_MISMATCH,
+            );
+            return;
+        }
+        // 预览位图以 k 倍铺到屏幕上，再留 2px + 抗锯齿余量。
+        let pad = 2.0 * k + 1.0;
+        let dx0 = ox + f64::from(x0) * k - pad;
+        let dy0 = oy + f64::from(y0) * k - pad;
+        let dx1 = ox + f64::from(x1) * k + pad;
+        let dy1 = oy + f64::from(y1) * k + pad;
+        let new = r(
+            dx0 as f32,
+            dy0 as f32,
+            (dx1 - dx0).max(1.0) as f32,
+            (dy1 - dy0).max(1.0) as f32,
+        );
+        self.frame_damage = Some(match self.frame_damage {
+            None => new,
+            Some(d) => {
+                let ux0 = d.x.min(new.x);
+                let uy0 = d.y.min(new.y);
+                let ux1 = (d.x + d.w).max(new.x + new.w);
+                let uy1 = (d.y + d.h).max(new.y + new.h);
+                r(ux0 as f32, uy0 as f32, (ux1 - ux0) as f32, (uy1 - uy0) as f32)
+            }
+        });
+    }
+
     /// 把文档画进指定矩形：纸色底 + 当前层笔迹，超出矩形裁剪。
     ///
     /// # 缓存
@@ -388,6 +473,8 @@ impl Inkflow {
         let Some(doc) = self.doc.as_ref() else {
             return;
         };
+        // 脏提示先取快照：后面为借用 `self` 的其他字段必须先结束对 doc 的借用。
+        let dirty = doc.dirty_since();
         let (scale, ox, oy) = view_of(doc, rect, zoom, pan);
         let dw = doc.width as f64 * scale;
         let dh = doc.height as f64 * scale;
@@ -406,35 +493,97 @@ impl Inkflow {
         let disp_w = (doc.width as f64 * render_scale).max(1.0) as u32;
         let disp_h = (doc.height as f64 * render_scale).max(1.0) as u32;
         let k = (scale / render_scale).max(1.0);
-        let layer = if opaque { doc.composite() } else { doc.image() };
+        let t_dv = std::time::Instant::now();
         // 版本号 + 显示尺寸做缓存键：版本号变化必然要重建，避免指针复用误判。
         let key = (doc.revision() as usize, disp_w, disp_h);
-        let cached_ok = self
-            .preview
+        let region = doc.dirty_since();
+        // 预览图先取出：patch 期间还要借用 `doc`，不能同时持有 &mut self.preview。
+        let mut prev = self.preview.take();
+        // 不透明（导出/缩略）才需要合成；画板本体直接用当前层像素的只读借用，
+        // 避免每帧为 `Document::image()` 的全图拷贝买单。
+        let composite_needed = opaque;
+        // 缓存可用只取决于「显示尺寸」：版本号每落一个点都会变，把它当命中条件
+        // 会让增量补丁永不生效（每帧退回整帧重采样，实测 16–25ms/帧）。
+        let cached_ok = prev
             .as_ref()
-            .map(|(p, w, h, _)| *p == key.0 && *w == key.1 && *h == key.2)
+            .map(|(_, w, h, _)| *w == disp_w && *h == disp_h)
             .unwrap_or(false);
         if !cached_ok {
-            let scaled = layer.resized(disp_w, disp_h);
-            let opaque = scaled.pixels().chunks_exact(4).filter(|p| p[3] > 0).count();
-            log::info!(
-                "doc view: rect=({:.0},{:.0},{:.0},{:.0}) disp={}x{} scale={:.3} opaque={}",
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                disp_w,
-                disp_h,
-                scale,
-                opaque
-            );
-            self.preview = Some((key.0, key.1, key.2, scaled));
+            // 键对不上（版本或显示尺寸变了）：丢弃旧图，走整帧重建。
+            prev = None;
+        } else {
+            // 增量路径：脏提示起点正好等于缓存版本且尺寸未变 → 只补脏区像素。
+            let can_patch = !composite_needed;
+            let patched = match (&mut prev, region) {
+                (Some((prev_rev, pw, ph, img)), Some((from, rect)))
+                    if can_patch
+                        && *pw == disp_w
+                        && *ph == disp_h
+                        && *prev_rev == from as usize =>
+                {
+                    match img.pixels_mut() {
+                        Some(out) => {
+                            let written = Image::resample_region_from(
+                                doc.layer_pixels(),
+                                doc.width,
+                                doc.height,
+                                disp_w,
+                                disp_h,
+                                out,
+                                rect,
+                            );
+                            // 把「这次只动了哪一块」告诉下游：预乘位图缓存据此
+                                // 只重算该窗口，省掉每帧整幅 4MB 的转换（约 2.7ms）。
+                            if let Some(w) = written {
+                                img.note_patch(w);
+                            }
+                            // 预览已补齐到当前版本：把键推进到本帧版本，
+                            // 下一帧脏提示起点与它对齐才能继续走增量路径。
+                            *prev_rev = key.0;
+                            true
+                        }
+                        // 像素仍被上一帧 `Scene` 共享：退回整帧重建（结果一致）。
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if !patched {
+                // 同为「缓存已过期」的路径，交给下面的整帧重建统一处理。
+                prev = None;
+            }
         }
+        if prev.is_none() {
+            let t_preview = std::time::Instant::now();
+            let scaled = if composite_needed {
+                doc.composite().resized(disp_w, disp_h)
+            } else {
+                Image::resized_from(
+                    doc.layer_pixels(),
+                    doc.width,
+                    doc.height,
+                    disp_w,
+                    disp_h,
+                )
+            };
+            crate::platform::perf::add_build_sub_us(
+                crate::platform::perf::BUILD_SUB_PREVIEW,
+                t_preview.elapsed(),
+            );
+            prev = Some((key.0, key.1, key.2, scaled));
+        }
+        self.preview = prev;
         if let Some((_, _, _, img)) = self.preview.as_ref() {
             // 位图按 k 整体铺开：不做重采样，缩放因此不受位图分辨率限制。
             c.draw_image_scaled(img, ox, oy, k);
         }
+        // 落笔期的局部脏区声明（仅「纯笔迹、无其他变化」时成立）。
+        self.note_stroke_damage(dirty, ox, oy, k);
         c.restore();
+        crate::platform::perf::add_build_sub_us(
+            crate::platform::perf::BUILD_SUB_DOCVIEW,
+            t_dv.elapsed(),
+        );
     }
 }
 

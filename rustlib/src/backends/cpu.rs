@@ -27,6 +27,8 @@ pub struct CpuBackend {
     prev_scene: Option<Scene>,
     /// 持久像素缓冲（帧间复用；窗口多缓冲内容不持久，必须自持）。
     pixmap: Option<crate::gfx::render::Pixmap>,
+    /// 持久软件光栅器（跨帧复用 `Resources` 里的字形 atlas 与 prep 缓存）。
+    raster: Option<crate::gfx::render::SoftwareRaster>,
 }
 
 #[cfg(target_os = "android")]
@@ -41,6 +43,7 @@ impl CpuBackend {
             window,
             prev_scene: None,
             pixmap: None,
+            raster: None,
         })
     }
 }
@@ -53,11 +56,19 @@ impl Backend for CpuBackend {
     ///    脏区外像素保持上一帧内容（避免全帧光栅化）；
     /// 3. 持久 Pixmap 整帧 memcpy 到窗口缓冲（多缓冲模型要求整帧上屏）。
     fn render_frame(&mut self, mut scene: Scene) -> Result<(), ()> {
-        // 先 diff（不 lock）：静止帧直接返回，避免无谓的 lock/post。
-        if let (Some(prev), Some(pm)) = (&self.prev_scene, &self.pixmap) {
-            if pm.width() == scene.width as u16 && pm.height() == scene.height as u16 {
-                if crate::gfx::render::diff_damage(prev, &scene).is_none() {
-                    return Ok(()); // 静止帧：不上屏。
+        // 场景声明「无变化」→ 直接返回，连 lock 都不做（静止帧零成本）。
+        if let Some(d) = scene.damage {
+            if d.w <= 0.0 || d.h <= 0.0 {
+                return Ok(());
+            }
+        }
+        // 未声明脏区时用帧间 diff 兜底：静止帧（diff 为 None）直接返回，避免无谓 lock/post。
+        if scene.damage.is_none() {
+            if let (Some(prev), Some(pm)) = (&self.prev_scene, &self.pixmap) {
+                if pm.width() == scene.width as u16 && pm.height() == scene.height as u16 {
+                    if crate::gfx::render::diff_damage(prev, &scene).is_none() {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -79,23 +90,42 @@ impl Backend for CpuBackend {
             || self.pixmap.as_ref().unwrap().height() != h
             || self.prev_scene.is_none();
 
+        let raster = self
+            .raster
+            .get_or_insert_with(|| crate::gfx::render::SoftwareRaster::new(w, h));
         if need_full {
-            let Some(pixmap) = crate::gfx::render::render_scene(&scene) else {
+            let pm = self
+                .pixmap
+                .get_or_insert_with(|| crate::gfx::render::Pixmap::new(w, h));
+            // 尺寸变化后光栅器视口也要跟上。
+            if raster.size() != (w, h) || pm.width() != w || pm.height() != h {
+                *raster = crate::gfx::render::SoftwareRaster::new(w, h);
+                *pm = crate::gfx::render::Pixmap::new(w, h);
+            }
+            if !raster.render(&scene, pm) {
                 return Err(());
-            };
-            self.pixmap = Some(pixmap);
+            }
         } else {
-            // 局部重绘：仅光栅化脏区行段，脏区外像素保持上一帧。
-            let prev = self.prev_scene.as_ref().unwrap();
-            let damage =
-                crate::gfx::render::diff_damage(prev, &scene).unwrap_or(crate::gfx::scene::Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: f64::from(w),
-                    h: f64::from(h),
-                });
-            let pm = self.pixmap.as_mut().unwrap();
-            let _ = crate::gfx::render::render_damage(&scene, pm, &damage);
+            // 局部重绘：优先用场景声明的脏区（精确），否则退回帧间 diff（保守）。
+            let damage = match scene.damage {
+                Some(d) => d,
+                None => {
+                    let prev = self.prev_scene.as_ref().ok_or(())?;
+                    crate::gfx::render::diff_damage(prev, &scene).unwrap_or(
+                        crate::gfx::scene::Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: f64::from(w),
+                            h: f64::from(h),
+                        },
+                    )
+                }
+            };
+            let pm = self.pixmap.as_mut().ok_or(())?;
+            if raster.size() != (w, h) {
+                *raster = crate::gfx::render::SoftwareRaster::new(w, h);
+            }
+            let _ = raster.render_rect(&scene, pm, &damage);
         }
         self.prev_scene = Some(scene);
 

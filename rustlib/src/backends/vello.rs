@@ -6,13 +6,15 @@
 //! 后端选择/降级链与真机验证不变）。
 
 use super::Backend;
-use super::gpu_common::{GpuBase, render_pixmap_frame};
+use super::gpu_common::{GpuBase, PixmapPresenter};
 use crate::gfx::scene::Scene;
 
 /// vello 后端（借用窗口，不拥有）。
 #[cfg(target_os = "android")]
 pub struct VelloBackend {
     base: GpuBase,
+    /// 持久化「光栅 → 纹理 → blit」呈现器（纹理/光栅器/字形缓存跨帧复用）。
+    presenter: PixmapPresenter,
 }
 
 #[cfg(target_os = "android")]
@@ -23,14 +25,17 @@ impl VelloBackend {
     /// 无 Vulkan / surface 构建失败返回 `Err`，由选择层（Task 8）降级。
     pub fn new(window_ptr: *mut std::ffi::c_void, width: u32, height: u32) -> Result<Self, ()> {
         let base = GpuBase::new(window_ptr, width, height)?;
-        Ok(Self { base })
+        Ok(Self {
+            base,
+            presenter: PixmapPresenter::new(),
+        })
     }
 }
 
 #[cfg(target_os = "android")]
 impl Backend for VelloBackend {
-    fn render_frame(&mut self, mut scene: Scene) -> Result<(), ()> {
-        render_pixmap_frame(&mut self.base, scene)
+    fn render_frame(&mut self, scene: Scene) -> Result<(), ()> {
+        self.presenter.render(&mut self.base, scene)
     }
 
     fn resize(&mut self, width: u32, height: u32) {

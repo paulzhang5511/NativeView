@@ -14,70 +14,210 @@ use raw_window_handle::{AndroidDisplayHandle, AndroidNdkWindowHandle};
 
 use super::Scene;
 
-/// Pixmap 上传 + blit 渲染（V1 GPU 后端共享路径）。
+/// 「CPU 光栅 → 纹理 → blit 上屏」的持久化呈现器（V1 GPU 后端共享路径）。
 ///
 /// # V1 简化说明
-/// gfx 命令先经 `gfx::render::render_scene` 软件光栅化为 Pixmap，再整帧
-/// 上传为纹理 blit 到 surface——非命令级 GPU 管线（vello 计算着色器
-/// 直渲归 V2）；V1 优先保证三后端共用同一 Scene 载体与正确像素输出。
+/// gfx 命令先经 `SoftwareRaster` 软件光栅化为 Pixmap，再上传为纹理 blit 到
+/// surface——非命令级 GPU 管线（vello 计算着色器直渲归 V2）；V1 优先保证
+/// 三后端共用同一 Scene 载体与正确像素输出。
+///
+/// # 为什么每一件都要持久化
+/// 早期实现每帧新建 `RenderContext`/`Resources`/`Texture`/`TextureBlitter`：
+/// - `Resources` 里是**字形 atlas 与前程缓存**，重建等于每帧重光栅全部字形；
+/// - 新建 `wgpu::Texture` 是驱动侧分配 + 整帧 10MB 上传；
+/// - `TextureBlitter::new` 每帧编译/blit 管线对象。
+/// 真机实测这三项让「静态页」也要 16ms/帧，持久化后同一帧只剩光栅与一次上传。
 #[cfg(target_os = "android")]
-pub fn render_pixmap_frame(base: &mut GpuBase, scene: Scene) -> Result<(), ()> {
-    let (w, h) = (base.width, base.height);
-    let mut scene = scene;
-    scene.width = w;
-    scene.height = h;
-    let Some(pixmap) = crate::gfx::render::render_scene(&scene) else {
-        return Err(());
-    };
-    log::trace!("gpu blit: pixmap rasterized {}x{}", w, h);
-    let pixels: &[u8] = pixmap.data_as_u8_slice();
-    let format = base.config.format;
+pub struct PixmapPresenter {
+    /// 跨帧复用的软件光栅器（含字形缓存）。
+    raster: Option<crate::gfx::render::SoftwareRaster>,
+    /// 跨帧复用的 CPU 像素缓冲（脏区重绘时其余像素保持上一帧）。
+    pixmap: Option<crate::gfx::render::Pixmap>,
+    /// 上传目标纹理（尺寸变化时重建）。
+    texture: Option<wgpu::Texture>,
+    /// 纹理视图（与 texture 同生命周期，避免每帧 create_view）。
+    view: Option<wgpu::TextureView>,
+    /// blit 管线对象（与 surface format 绑定，只建一次）。
+    blitter: Option<wgpu::util::TextureBlitter>,
+    /// 当前纹理/像素缓冲尺寸。
+    size: (u32, u32),
+}
 
-    render_frame_with(base, move |device, queue, frame| {
-        log::trace!("gpu blit: frame acquired");
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("pixmap-upload"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
+#[cfg(target_os = "android")]
+impl PixmapPresenter {
+    /// 空呈现器（首帧懒分配）。
+    pub fn new() -> Self {
+        Self {
+            raster: None,
+            pixmap: None,
+            texture: None,
+            view: None,
+            blitter: None,
+            size: (0, 0),
+        }
+    }
+
+    /// 尺寸变化：丢弃纹理与视图（像素缓冲由光栅器按需重建）。
+    fn invalidate(&mut self) {
+        self.texture = None;
+        self.view = None;
+        self.size = (0, 0);
+    }
+
+    /// 渲染并上屏一帧。
+    ///
+    /// # 脏区语义（`Scene.damage`）
+    /// - `Some(空)`：整帧跳过（不 acquire、不 present），静止页零 vsync 占用；
+    /// - `Some(rect)`：只光栅该块、只上传该块，其余像素沿用上一帧纹理；
+    /// - `None`：整帧光栅 + 整帧上传。
+    pub fn render(&mut self, base: &mut GpuBase, mut scene: Scene) -> Result<(), ()> {
+        use crate::platform::perf::{record_sub_us, SUB_PRESENT, SUB_RASTER, SUB_UPLOAD};
+        let (w, h) = (base.width, base.height);
+        scene.width = w;
+        scene.height = h;
+
+        // 尺寸变化：光栅器视口与纹理都要重建（脏区差分不再成立）。
+        if self.size != (w, h) {
+            self.invalidate();
+            self.size = (w, h);
+        }
+
+        // 空脏区 = 本帧无变化：直接返回，连 acquire 都不做。
+        let damage = match scene.damage {
+            Some(d) if d.w <= 0.0 || d.h <= 0.0 => return Ok(()),
+            other => other,
+        };
+
+        crate::platform::perf::reset_sub(crate::platform::perf::SUB_IMAGE);
+        let t_raster = std::time::Instant::now();
+        let raster = self
+            .raster
+            .get_or_insert_with(|| crate::gfx::render::SoftwareRaster::new(w as u16, h as u16));
+        let pixmap = self
+            .pixmap
+            .get_or_insert_with(|| crate::gfx::render::Pixmap::new(w as u16, h as u16));
+        // 只有「已有完整上一帧」时才走局部重绘，否则必须整帧。
+        // `Some(true)` = 已局部重绘；`Some(false)` = 脏区无像素；`None` = 需整帧。
+        let partial = match damage {
+            Some(d) if self.texture.is_some() => raster.render_rect(&scene, pixmap, &d),
+            _ => None,
+        };
+        let ready = match partial {
+            Some(_) => true,
+            None => raster.render(&scene, pixmap),
+        };
+        record_sub_us(SUB_RASTER, t_raster.elapsed());
+        if !ready {
+            return Err(());
+        }
+        crate::platform::perf::note_frame_mode(matches!(partial, Some(true)));
+
+        let format = base.config.format;
+        // 局部重绘成功时只上传脏块；整帧渲染或纹理尚未建立时整帧上传。
+        let needs_upload_full = !matches!(partial, Some(true)) || self.texture.is_none();
+        let t_upload = std::time::Instant::now();
+        if needs_upload_full {
+            let texture = base.ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("pixmap-upload"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.view = Some(texture.create_view(&Default::default()));
+            self.texture = Some(texture);
+            let pixels = pixmap.data_as_u8_slice();
+            base.ctx.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: self.texture.as_ref().ok_or(())?,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        } else if let Some(d) = damage {
+            // 局部上传：只写脏矩形（行跨距仍是整帧宽度）。
+            let x0 = d.x.max(0.0).floor() as u32;
+            let y0 = d.y.max(0.0).floor() as u32;
+            let x1 = (d.x + d.w).min(f64::from(w)).ceil() as u32;
+            let y1 = (d.y + d.h).min(f64::from(h)).ceil() as u32;
+            if x1 > x0 && y1 > y0 {
+                let pitch = (w * 4) as usize;
+                let off = (y0 as usize) * pitch + (x0 as usize) * 4;
+                let pixels = pixmap.data_as_u8_slice();
+                base.ctx.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: self.texture.as_ref().ok_or(())?,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: x0, y: y0, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &pixels[off..],
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 4),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: x1 - x0,
+                        height: y1 - y0,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+        record_sub_us(SUB_UPLOAD, t_upload.elapsed());
+
+        let t_acq = std::time::Instant::now();
+        let frame = base.acquire_frame()?;
+        // 等 vsync 的时长单独记：它不是本帧的计算成本（见 `SUB_ACQUIRE` 注释）。
+        record_sub_us(
+            crate::platform::perf::SUB_ACQUIRE,
+            t_acq.elapsed(),
         );
-        let texture_view = texture.create_view(&Default::default());
+        let t_present = std::time::Instant::now();
         let surface_view = frame.texture.create_view(&Default::default());
-        let blitter = wgpu::util::TextureBlitter::new(device, format);
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        blitter.copy(device, &mut encoder, &texture_view, &surface_view);
-        queue.submit([encoder.finish()]);
-        log::trace!("gpu blit: submitted");
+        let blitter = match self.blitter.as_ref() {
+            Some(b) => b,
+            None => {
+                let b = wgpu::util::TextureBlitter::new(&base.ctx.device, format);
+                self.blitter = Some(b);
+                self.blitter.as_ref().ok_or(())?
+            }
+        };
+        let mut encoder = base
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        blitter.copy(
+            &base.ctx.device,
+            &mut encoder,
+            self.view.as_ref().ok_or(())?,
+            &surface_view,
+        );
+        base.ctx.queue.submit([encoder.finish()]);
+        base.ctx.queue.present(frame);
+        record_sub_us(SUB_PRESENT, t_present.elapsed());
         Ok(())
-    })
+    }
 }
 
 /// GPU 后端共享的 wgpu 资源集合。

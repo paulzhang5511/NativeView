@@ -8,6 +8,8 @@
 //! - 渐变映射：ColorStop（非预乘 RGBA8888）→ peniko ColorStop（Srgb f32），
 //!   alpha 由 vello_cpu 内部处理预乘。
 
+use std::collections::VecDeque;
+
 use vello_cpu::color::AlphaColor;
 use vello_cpu::color::Srgb;
 use vello_cpu::kurbo::{Affine, BezPath, Point, Rect as KurboRect, Stroke as KurboStroke};
@@ -30,27 +32,141 @@ use super::shader::{Shader, TileMode};
 /// 尺寸超 u16::MAX 视为非法（返回 `None`，不 panic）；
 /// 返回缓冲长度恒为 `width * height * 4`。
 pub fn render_scene(scene: &Scene) -> Option<Pixmap> {
+    let (w, h) = scene_dims(scene)?;
+    let mut raster = SoftwareRaster::new(w, h);
+    let mut pixmap = Pixmap::new(w, h);
+    raster.render(scene, &mut pixmap).then_some(pixmap)
+}
+
+/// 场景尺寸合法化（0 或超 u16 上限 → None）。
+fn scene_dims(scene: &Scene) -> Option<(u16, u16)> {
     let (w, h) = (scene.width, scene.height);
     if w == 0 || h == 0 || w > u16::MAX as u32 || h > u16::MAX as u32 {
         return None;
     }
-    let (w, h) = (w as u16, h as u16);
-    let mut ctx = RenderContext::new(w, h);
-    let mut resources = Resources::new();
-    let mut pixmap = Pixmap::new(w, h);
+    Some((w as u16, h as u16))
+}
 
-    // 清屏：整幅覆盖（透明清屏色 = 透明黑，与 Android 硬件缓冲语义一致）。
-    ctx.set_paint(to_alpha_color(scene.clear_color));
-    ctx.fill_rect(&KurboRect::from_points(
-        (0.0, 0.0),
-        (f64::from(w), f64::from(h)),
-    ));
+/// 跨帧复用的软件光栅器。
+///
+/// # 为什么要复用
+/// `RenderContext` 与 `Resources` 里各自持有可复用状态：前者是 tile 调度器与
+/// 临时几何缓冲，后者是**字形 atlas 与字形 prep 缓存**。逐帧重建会让每一帧都
+/// 重新光栅化全部字形轮廓（文字密集的页面单这一项就能吃掉 10ms+）。
+///
+/// # 不变量
+/// - 尺寸只经 [`Self::resize`] 变更；变更后 `ctx` 与目标 `Pixmap` 必须同尺寸；
+/// - [`Self::render`] / [`Self::render_rect`] 入口自带 `ctx.reset()`，
+///   调用方无需关心上一帧残留的裁剪栈与变换。
+pub struct SoftwareRaster {
+    ctx: RenderContext,
+    resources: Resources,
+    width: u16,
+    height: u16,
+}
 
-    replay(scene, &mut ctx, &mut resources, None);
+impl SoftwareRaster {
+    /// 按视口尺寸构造（尺寸非法时钳到 1×1，调用方应先用 `scene_dims` 校验）。
+    pub fn new(width: u16, height: u16) -> Self {
+        Self {
+            ctx: RenderContext::new(width.max(1), height.max(1)),
+            resources: Resources::new(),
+            width: width.max(1),
+            height: height.max(1),
+        }
+    }
 
-    ctx.render(&mut pixmap, &mut resources);
-    log::debug!("render: rendered to pixmap");
-    Some(pixmap)
+    /// 当前光栅视口尺寸。
+    pub fn size(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
+
+    /// 视口尺寸变化（窗口旋转/分屏）。尺寸不变时不触碰内部状态。
+    pub fn resize(&mut self, width: u16, height: u16) {
+        let (width, height) = (width.max(1), height.max(1));
+        if width == self.width && height == self.height {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        self.ctx.reset_and_resize(width, height);
+    }
+
+    /// 整帧渲染到 `out`（尺寸必须与视口一致）。
+    ///
+    /// # 返回
+    /// `false` = 尺寸非法（场景 0 边或超 u16 上限）。
+    pub fn render(&mut self, scene: &Scene, out: &mut Pixmap) -> bool {
+        let Some((w, h)) = scene_dims(scene) else {
+            return false;
+        };
+        if (w, h) != self.size() {
+            self.resize(w, h);
+        }
+        self.ctx.reset();
+        // 清屏：整幅覆盖（透明清屏色 = 透明黑，与 Android 硬件缓冲语义一致）。
+        self.ctx.set_paint(to_alpha_color(scene.clear_color));
+        self.ctx.fill_rect(&KurboRect::from_points(
+            (0.0, 0.0),
+            (f64::from(w), f64::from(h)),
+        ));
+        replay(scene, &mut self.ctx, &mut self.resources, None);
+        self.ctx.render(out, &mut self.resources);
+        true
+    }
+
+    /// 只重绘脏区到 `out`（其余像素保持上一帧内容）。
+    ///
+    /// # 返回
+    /// `Some(true)` = 已重绘；`Some(false)` = 脏区与视口无交集（调用方可跳过上传）；
+    /// `None` = 场景尺寸非法。
+    ///
+    /// # 为什么脏区也用全帧坐标系
+    /// `RasterizerSettings.offset` 只把光栅结果平移进小目标，场景坐标不变——
+    /// 缩小上下文会改变光栅器坐标空间，破坏与整帧渲染的逐像素一致性。
+    pub fn render_rect(&mut self, scene: &Scene, out: &mut Pixmap, damage: &Rect) -> Option<bool> {
+        let (w, h) = scene_dims(scene)?;
+        if (w, h) != self.size() {
+            self.resize(w, h);
+        }
+        let x0 = damage.x.max(0.0).floor() as u32;
+        let y0 = damage.y.max(0.0).floor() as u32;
+        let x1 = (damage.x + damage.w).min(f64::from(w)).ceil() as u32;
+        let y1 = (damage.y + damage.h).min(f64::from(h)).ceil() as u32;
+        if x0 >= x1 || y0 >= y1 {
+            return Some(false);
+        }
+        let (dw, dh) = ((x1 - x0) as u16, (y1 - y0) as u16);
+        if dw >= w && dh >= h {
+            return Some(self.render(scene, out));
+        }
+        self.ctx.reset();
+        self.ctx.set_paint(to_alpha_color(scene.clear_color));
+        self.ctx.fill_rect(&KurboRect::from_points(
+            (0.0, 0.0),
+            (f64::from(w), f64::from(h)),
+        ));
+        replay(scene, &mut self.ctx, &mut self.resources, Some(damage));
+        let mut tmp = Pixmap::new(w, dh);
+        let settings = RasterizerSettings {
+            offset: (-(x0 as i32), -(y0 as i32)),
+            target_init: TargetInit::SrcOver,
+            ..Default::default()
+        };
+        self.ctx.render_with(&mut tmp, &mut self.resources, settings);
+        // 拷回脏区行段：tmp 列 0 已对应场景 x0（负偏移完成平移）。
+        let src = tmp.data_as_u8_slice();
+        let dst = out.data_as_u8_slice_mut();
+        let pitch = (w as usize) * 4;
+        let seg_bytes = (dw as usize) * 4;
+        let seg_off = (x0 as usize) * 4;
+        for row in 0..dh as usize {
+            let sy = row * pitch;
+            let dy = ((y0 as usize) + row) * pitch + seg_off;
+            dst[dy..dy + seg_bytes].copy_from_slice(&src[sy..sy + seg_bytes]);
+        }
+        Some(true)
+    }
 }
 
 /// 图片绘制：Image → vello_common ImageSource（Pixmap 共享）。
@@ -61,6 +177,189 @@ pub fn render_scene(scene: &Scene) -> Option<Pixmap> {
 /// # 缓存
 /// 预乘 Pixmap 按 Image 像素指针缓存（thread-local），避免每帧重复
 /// RGBA→PremulRgba8 转换（大图 1080×1920 = 8MB 逐像素运算）。
+/// 图像预乘缓存的字节预算。
+///
+/// # 为什么必须有上限
+/// 缓存键是像素指针：落笔每次都会产生新 `Arc`，若只增不删，长笔一笔一点
+/// 就往里塞一份 4MB 级缓冲，几分钟就会把设备内存吃光（低端机直接 OOM 掉）。
+/// 这里按「总字节预算 + 最久未用淘汰」封顶。
+const PM_CACHE_BUDGET: u64 = 40 * 1024 * 1024;
+
+/// 预乘缓存条目（缓存的是供 vello_cpu 直接采样的 `Pixmap`）。
+struct PremulCache {
+    /// 键 = (像素缓冲首地址, 就地改写代际)。
+    map: std::collections::HashMap<(usize, u32), (std::sync::Arc<Pixmap>, u64)>,
+    /// 最近使用顺序（尾部最新）。命中时挪到尾部，超预算从头部淘汰。
+    order: VecDeque<(usize, u32)>,
+    /// 每个像素指针最近一次建好的代际：代际恰好 +1 且图片给出了补丁窗口时，
+    /// 可以在这张位图上就地补一块，而不是整幅重算。
+    latest: std::collections::HashMap<usize, u32>,
+    bytes: u64,
+}
+
+impl PremulCache {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: VecDeque::new(),
+            latest: std::collections::HashMap::new(),
+            bytes: 0,
+        }
+    }
+
+    fn touch(&mut self, key: (usize, u32)) {
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+    }
+
+    /// 摘掉某个键（用于「旧的代际」被就地升级成新代际）。
+    fn take(&mut self, key: (usize, u32)) -> Option<std::sync::Arc<Pixmap>> {
+        let (pm, b) = self.map.remove(&key)?;
+        self.bytes = self.bytes.saturating_sub(b);
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(pos);
+        }
+        Some(pm)
+    }
+
+    fn insert(&mut self, key: (usize, u32), pm: std::sync::Arc<Pixmap>, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.map.insert(key, (pm, bytes));
+        self.latest.insert(key.0, key.1);
+        self.touch(key);
+        while self.bytes > PM_CACHE_BUDGET {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, b)) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(b);
+            }
+        }
+    }
+}
+
+/// 测试用：局部补算命中次数（仅供单测断言「增量路径确实走了」）。
+#[cfg(test)]
+static INCR_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 把 `rect` 窗口内的像素就地转成预乘（其余部分保持原样）。
+///
+/// # 语义
+/// 与整幅转换逐像素一致；窗口按行带并行，行数很少时（常见的一小段笔迹）
+/// 会退化为单线程，避免为几十行付线程创建开销。
+fn premul_rows_in(pm: &mut Pixmap, image: &Image, rect: (u32, u32, u32, u32)) {
+    let w = pm.width() as usize;
+    let h = pm.height() as usize;
+    let x0 = (rect.0 as usize).min(w);
+    let x1 = (rect.2 as usize).min(w).max(x0);
+    let y0 = (rect.1 as usize).min(h);
+    let y1 = (rect.3 as usize).min(h).max(y0);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let pixels = image.pixels();
+    let buf = pm.data_mut();
+    let rows = y1 - y0;
+    crate::platform::perf::add_premul_pixels((rows * (x1 - x0)) as u64);
+    let band = &mut buf[y0 * w..y1 * w];
+    let min_rows = 24;
+    crate::gfx::parallel::par_rows(band, rows, min_rows, |band, first_row| {
+        for (i, out) in band.iter_mut().enumerate() {
+            let row = first_row + i / w;
+            let col = i % w;
+            if col < x0 || col >= x1 {
+                continue;
+            }
+            let idx = (y0 + row) * w + col;
+            let (r, g, b, a) = (
+                pixels[idx * 4],
+                pixels[idx * 4 + 1],
+                pixels[idx * 4 + 2],
+                pixels[idx * 4 + 3],
+            );
+            *out = vello_cpu::color::PremulRgba8 {
+                r: ((r as u16 * a as u16) / 255) as u8,
+                g: ((g as u16 * a as u16) / 255) as u8,
+                b: ((b as u16 * a as u16) / 255) as u8,
+                a,
+            };
+        }
+    });
+}
+
+/// 取（必要时生成）`image` 的预乘 Pixmap。
+///
+/// # 线程模型
+/// 缓存是 thread_local：每个渲染线程各自持有一份（当前只有主渲染线程），
+/// 命中不走锁，未命中才做一次像素转换（大图按行带并行）。
+fn premul_cache_acquire(
+    key: (usize, u32),
+    w: u16,
+    h: u16,
+    image: &Image,
+) -> std::sync::Arc<Pixmap> {
+    let (ptr, rev) = key;
+    thread_local! {
+        static PM_CACHE: std::cell::RefCell<PremulCache> =
+            std::cell::RefCell::new(PremulCache::new());
+    }
+    PM_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((cached, _)) = cache.map.get(&key) {
+            let pm = std::sync::Arc::clone(cached);
+            cache.touch(key);
+            return pm;
+        }
+        // 同一指针、代际恰好 +1、且图片声明了补丁窗口 → 在上一张位图上就地补一块。
+        if let Some(rect) = image.patch() {
+            let prev_rev = rev.wrapping_sub(1);
+            if cache.latest.get(&ptr) == Some(&prev_rev) {
+                if let Some(arc) = cache.take((ptr, prev_rev)) {
+                    // 上一帧 Scene 已释放时是唯一持有者，`make_mut` 不产生拷贝。
+                    let mut arc = arc;
+                    let pm = std::sync::Arc::make_mut(&mut arc);
+                    if pm.width() == w && pm.height() == h {
+                        let bytes = u64::from(w) * u64::from(h) * 4;
+                        premul_rows_in(pm, image, rect);
+                        #[cfg(test)]
+                        INCR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        cache.insert(key, std::sync::Arc::clone(&arc), bytes);
+                        return arc;
+                    }
+                }
+            }
+        }
+        // 紧凑 RGBA → 预乘 PremulRgba8 Pixmap（vello_cpu 内部位图格式）。
+        let mut pm = Pixmap::new(w, h);
+        let pixels = image.pixels();
+        let px_wide = w as usize;
+        crate::gfx::parallel::par_rows(pm.data_mut(), h as usize, 64, |band, first_row| {
+            for (i, out) in band.iter_mut().enumerate() {
+                let idx = first_row * px_wide + i;
+                let (r, g, b, a) = (
+                    pixels[idx * 4],
+                    pixels[idx * 4 + 1],
+                    pixels[idx * 4 + 2],
+                    pixels[idx * 4 + 3],
+                );
+                *out = vello_cpu::color::PremulRgba8 {
+                    r: ((r as u16 * a as u16) / 255) as u8,
+                    g: ((g as u16 * a as u16) / 255) as u8,
+                    b: ((b as u16 * a as u16) / 255) as u8,
+                    a,
+                };
+            }
+        });
+        crate::platform::perf::add_premul_pixels(u64::from(w) * u64::from(h));
+        let bytes = u64::from(w) * u64::from(h) * 4;
+        let arc = std::sync::Arc::new(pm);
+        cache.insert(key, std::sync::Arc::clone(&arc), bytes);
+        arc
+    })
+}
+
 fn draw_image_cmd(
     ctx: &mut RenderContext,
     resources: &mut Resources,
@@ -72,41 +371,15 @@ fn draw_image_cmd(
     let w = image.width().min(u16::MAX as u32) as u16;
     let h = image.height().min(u16::MAX as u32) as u16;
 
-    // 缓存键：像素 Arc 指针（同一 Image 实例跨帧共享同一 Arc）。
-    let key = image.pixels().as_ptr() as usize;
-    thread_local! {
-        static PM_CACHE: std::cell::RefCell<std::collections::HashMap<usize, std::sync::Arc<Pixmap>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    let pm: std::sync::Arc<Pixmap> = PM_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(cached) = cache.get(&key) {
-            std::sync::Arc::clone(cached)
-        } else {
-            // 紧凑 RGBA → 预乘 PremulRgba8 Pixmap（vello_cpu 内部位图格式）。
-            let mut pm = Pixmap::new(w, h);
-            let pixels = image.pixels();
-            let dst = pm.data_mut();
-            for i in 0..(w as usize * h as usize) {
-                let (r, g, b, a) = (
-                    pixels[i * 4],
-                    pixels[i * 4 + 1],
-                    pixels[i * 4 + 2],
-                    pixels[i * 4 + 3],
-                );
-                let premul = vello_cpu::color::PremulRgba8 {
-                    r: ((r as u16 * a as u16) / 255) as u8,
-                    g: ((g as u16 * a as u16) / 255) as u8,
-                    b: ((b as u16 * a as u16) / 255) as u8,
-                    a,
-                };
-                dst[i] = premul;
-            }
-            let arc = std::sync::Arc::new(pm);
-            cache.insert(key, std::sync::Arc::clone(&arc));
-            arc
-        }
-    });
+    // 缓存键：像素指针 + 就地改写代际。指针相同但内容被就地补丁过时必须
+    // 视为未命中，否则画板增量预览会一直画着旧帧的预乘位图。
+    let ptr = image.pixels().as_ptr();
+    let key = (ptr as usize, crate::gfx::image::mutation_rev(ptr));
+    let t_pm = std::time::Instant::now();
+    let pm: std::sync::Arc<Pixmap> = premul_cache_acquire(key, w, h, image);
+    // 预乘转换是「图像绘制」里唯一的大头（每帧命中不到缓存时按像素重算）。
+    // 记在累加型子阶段里：一帧可能画多张图。
+    crate::platform::perf::add_sub_us(crate::platform::perf::SUB_IMAGE, t_pm.elapsed());
 
     // ImageBrush（vello_common::paint::Image = ImageBrush<ImageSource>）。
     let brush = vello_cpu::Image {
@@ -581,6 +854,94 @@ mod tests {
     use super::*;
     use crate::gfx::canvas::Canvas;
     use crate::gfx::paint::PaintStyle;
+
+    /// 只补一块的预乘结果必须与「整幅重算」逐字节一致。
+    #[test]
+    fn incremental_premul_matches_full_rebuild() {
+        let (w, h) = (64u32, 64u32);
+        let mut img = Image::from_rgba8(w, h, vec![0x20u8; (w * h * 4) as usize]);
+        let mut c0 = Canvas::new(w, h);
+        c0.draw_image(&img, 0.0, 0.0);
+        let mut s0 = c0.finish();
+        s0.clear_color = Color::rgb(0, 0, 0);
+        let mut raster = SoftwareRaster::new(w as u16, h as u16);
+        let mut out_first = Pixmap::new(w as u16, h as u16);
+        assert!(raster.render(&s0, &mut out_first));
+        drop(s0);
+
+        // 就地补一块（左上 8..24）：只有这块该变。
+        let rect = (8u32, 8u32, 24u32, 24u32);
+        let px = img.pixels_mut().expect("unique");
+        for y in rect.1..rect.3 {
+            for x in rect.0..rect.2 {
+                let o = ((y * w + x) * 4) as usize;
+                px[o..o + 4].copy_from_slice(&[0, 0, 255, 255]);
+            }
+        }
+        img.note_patch(rect);
+
+        let mut c1 = Canvas::new(w, h);
+        c1.draw_image(&img, 0.0, 0.0);
+        let mut s1 = c1.finish();
+        s1.clear_color = Color::rgb(0, 0, 0);
+        let mut out_inc = Pixmap::new(w as u16, h as u16);
+        assert!(raster.render(&s1, &mut out_inc));
+        drop(s1);
+
+        assert!(
+            INCR_HITS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the incremental path must be exercised"
+        );
+
+        // 参照：同样的像素内容放在一个全新 Image 上（新指针 → 强制整幅重算）。
+        let fresh = Image::from_rgba8(w, h, img.pixels().to_vec());
+        let mut c2 = Canvas::new(w, h);
+        c2.draw_image(&fresh, 0.0, 0.0);
+        let mut s2 = c2.finish();
+        s2.clear_color = Color::rgb(0, 0, 0);
+        let mut out_full = Pixmap::new(w as u16, h as u16);
+        assert!(raster.render(&s2, &mut out_full));
+
+        assert_eq!(
+            out_inc.data_as_u8_slice(),
+            out_full.data_as_u8_slice(),
+            "incremental premultiply must match a full rebuild"
+        );
+    }
+
+    /// 就地改写图片像素后，第二次渲染必须看到新内容。
+    ///
+    /// 回归：预乘位图缓存只按像素指针做键，落笔期「同一 Arc 就地补丁」会一直
+    /// 命中旧缓存——画板上表现为"只有第一笔落下时的样子"。
+    #[test]
+    fn in_place_patch_invalidates_premultiplied_cache() {
+        let mut img = Image::from_rgba8(64, 64, vec![0u8; 64 * 64 * 4]);
+        let mut c = Canvas::new(64, 64);
+        c.draw_image(&img, 0.0, 0.0);
+        let mut scene = c.finish();
+        scene.clear_color = Color::rgb(0, 0, 0);
+        let mut raster = SoftwareRaster::new(64, 64);
+        let mut out = Pixmap::new(64, 64);
+        assert!(raster.render(&scene, &mut out));
+        let before = out.data_as_u8_slice()[..16].to_vec();
+        assert_eq!(before[0], 0, "empty source must leave the clear colour");
+
+        // 就地补丁：先确保没有别处仍持有同一像素 Arc（Scene 里的命令会持一份）。
+        drop(scene);
+        let px = img.pixels_mut().expect("unique ownership");
+        for v in px.chunks_mut(4) {
+            v.copy_from_slice(&[255, 0, 0, 255]);
+        }
+        let mut c2 = Canvas::new(64, 64);
+        c2.draw_image(&img, 0.0, 0.0);
+        let mut scene2 = c2.finish();
+        scene2.clear_color = Color::rgb(0, 0, 0);
+        let mut out2 = Pixmap::new(64, 64);
+        assert!(raster.render(&scene2, &mut out2));
+        let after = out2.data_as_u8_slice()[..16].to_vec();
+        assert_eq!(after[3], 255, "patched pixels must reach the rasterizer");
+        assert_eq!(after[0], 255, "patched colour must be the new one");
+    }
 
     /// 图像绘制在偏移位置：目标坐标必须精确落位，不能按画布原点采样。
     ///

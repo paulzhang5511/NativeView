@@ -325,6 +325,51 @@ struct WakePipe {
 /// 唤醒 eventfd 的全局副本（-1 = 不可用）；供 IME 桥等跨线程路径唤醒主循环。
 static WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// 真 vsync 帧信号（AChoreographer 回调置位，主循环消费）。
+static VSYNC_TICK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Choreographer 是否可用（拿不到实例时退回 16ms 轮询）。
+static VSYNC_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Choreographer 实例（线程局部、进程生命周期存活；仅存地址供回调投递）。
+static VSYNC_INSTANCE: std::sync::atomic::AtomicPtr<super::sys::choreographer::AChoreographer> =
+    std::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// vsync 回调：只置位 + 唤醒主循环，不做任何渲染（借用都在主循环体里）。
+extern "C" fn on_vsync(_frame_time_nanos: i64, _data: *mut core::ffi::c_void) {
+    VSYNC_TICK.store(true, std::sync::atomic::Ordering::Release);
+    wake_main_loop();
+}
+
+/// 初始化 Choreographer（必须在已 attach looper 的主循环线程调用）。
+fn init_vsync() {
+    // SAFETY: 当前线程已 prepare looper，getInstance 返回线程局部单例。
+    let inst = unsafe { super::sys::choreographer::AChoreographer_getInstance() };
+    if inst.is_null() {
+        warn!("AChoreographer unavailable, falling back to poll pacing");
+        return;
+    }
+    VSYNC_INSTANCE.store(
+        inst as *mut super::sys::choreographer::AChoreographer,
+        std::sync::atomic::Ordering::Release,
+    );
+    VSYNC_ENABLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// 投递下一次 vsync 帧回调（一次性；同回调重复投递由系统合并）。
+fn post_vsync_frame() {
+    let inst = VSYNC_INSTANCE.load(std::sync::atomic::Ordering::Acquire);
+    if inst.is_null() {
+        return;
+    }
+    // SAFETY: inst 来自 getInstance（线程局部存活）；回调为静态函数。
+    unsafe {
+        super::sys::choreographer::AChoreographer_postFrameCallback64(
+            inst,
+            on_vsync,
+            core::ptr::null_mut(),
+        );
+    }
+}
+
 /// 跨线程唤醒主循环（任何线程可调用；无唤醒通道时静默无效）。
 pub fn wake_main_loop() {
     let fd = WAKE_FD.load(std::sync::atomic::Ordering::Acquire);
@@ -753,6 +798,8 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
     let mut last_rss_sample = std::time::Instant::now();
 
     loop {
+        // 本轮起点帧序号：用于判断「本轮是否已因输入事件出过帧」。
+        let frames_at_round_start = crate::platform::perf::frame_seq();
         // 1) 同步交接状态（每轮全量拉取，唤醒丢失无正确性影响）。
         let (
             take_window,
@@ -886,6 +933,16 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                         None => warn!("no backend available"),
                     }
                     current_window = Some(w);
+                    // 真 vsync 节拍：Choreographer 回调驱动动画/落笔帧。
+                    init_vsync();
+                    // 性能基准（`debug.nativeview.bench=N` 门控）：首帧上屏后
+                    // 连续渲染 N 帧，输出纯渲染吞吐（与 vsync 解耦）。
+                    if let (Some(d), Some(b)) = (demo.as_mut(), _current_backend.as_mut()) {
+                        run_bench_if_requested(d, b);
+                    }
+                    if let Some(d) = demo.as_mut() {
+                        setup_live_bench(d);
+                    }
                 }
                 None => {
                     // 协议错误（NULL）：归还引用防泄漏。
@@ -898,12 +955,7 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
             if let (Some(d), Some(b)) = (demo.as_mut(), _current_backend.as_mut()) {
                 d.resize(w as i32, h as i32);
                 b.resize(w, h);
-                let scene = d.render();
-                if b.render_frame(scene).is_ok() {
-                    frame_stats.record_frame();
-                } else {
-                    warn!("resize frame render failed");
-                }
+                render_and_record(d, b, &mut frame_stats, "resize");
             } else if let Some(d) = demo.as_mut() {
                 d.resize(w as i32, h as i32);
             }
@@ -915,24 +967,14 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
             if let Some(d) = demo.as_mut() {
                 d.cancel_touch();
                 if let Some(b) = _current_backend.as_mut() {
-                    let scene = d.render();
-                    if b.render_frame(scene).is_ok() {
-                        frame_stats.record_frame();
-                    } else {
-                        warn!("cancel frame render failed");
-                    }
+                    render_and_record(d, b, &mut frame_stats, "cancel");
                 }
             }
         }
 
         if redraw {
             if let (Some(d), Some(b)) = (demo.as_mut(), _current_backend.as_mut()) {
-                let scene = d.render();
-                if b.render_frame(scene).is_ok() {
-                    frame_stats.record_frame();
-                } else {
-                    warn!("redraw frame failed");
-                }
+                render_and_record(d, b, &mut frame_stats, "redraw");
             }
         }
 
@@ -1011,12 +1053,7 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                         // 点击导致状态变更：重绘 + 重新推送快照。
                         a11y_dirty = true;
                         if let Some(b) = _current_backend.as_mut() {
-                            let scene = d.render();
-                            if b.render_frame(scene).is_ok() {
-                                frame_stats.record_frame();
-                            } else {
-                                warn!("a11y click frame render failed");
-                            }
+                            render_and_record(d, b, &mut frame_stats, "a11y");
                         }
                     }
                 }
@@ -1062,18 +1099,21 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
             }
             if ime_dirty {
                 if let (Some(d), Some(b)) = (demo.as_mut(), _current_backend.as_mut()) {
-                    let scene = d.render();
-                    if b.render_frame(scene).is_ok() {
-                        frame_stats.record_frame();
-                    } else {
-                        warn!("ime frame render failed");
-                    }
+                    render_and_record(d, b, &mut frame_stats, "ime");
                 }
             }
         }
-        // 超时策略：Draw 页动画 16ms（近似 vsync），其余无限阻塞；
-        // IME 桥的文本/inset 变化经 eventfd 唤醒（零轮询开销）。
-        let anim_timeout: i32 = if demo.as_ref().is_some_and(|d| d.needs_frames()) {
+        // 帧节拍：需要持续帧时投递一次 Choreographer 回调，由系统 vsync 唤醒；
+        // 拿不到 Choreographer 的设备退回 16ms 轮询（行为与旧实现一致）。
+        let wants_frames = demo.as_ref().is_some_and(|d| d.needs_frames());
+        // 落笔实测期间由我们自己要帧（模拟"手指持续移动"的真实 60Hz 输入）。
+        let live_active = live_bench_active();
+        if wants_frames || live_active {
+            post_vsync_frame();
+        }
+        let vsync_driven = (wants_frames || live_active)
+            && VSYNC_ENABLED.load(std::sync::atomic::Ordering::Acquire);
+        let anim_timeout: i32 = if wants_frames && !vsync_driven {
             16
         } else {
             -1
@@ -1095,9 +1135,12 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                 &mut out_data,
             )
         };
-        // 近似 vsync 超时到达：推进 P2 动画并按需重绘（PRD §5.1.6：
-        // 时间基准统一 Choreographer 帧回调——V1 以 poll 超时近似）。
-        if ident == super::sys::looper::ALOOPER_POLL_TIMEOUT {
+        // 帧到达：真 vsync 回调置位（或退化模式下的 16ms 轮询超时）。
+        // 本轮已因输入事件出过帧时不再重复出帧（同 vsync 内一帧一次）。
+        let vsync_fired = VSYNC_TICK.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let frame_due = vsync_fired
+            || ident == super::sys::looper::ALOOPER_POLL_TIMEOUT;
+        if frame_due && (live_active || crate::platform::perf::frame_seq() == frames_at_round_start) {
             let frame_result = if let (Some(d), Some(b)) =
                 (demo.as_mut(), _current_backend.as_mut())
             {
@@ -1107,31 +1150,69 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
                 let now = start.elapsed().as_millis() as u64;
                 // 调用链耗时分解：advance → build → render 三段独立计时。
                 let mut trace = crate::platform::perf::FrameTrace::new();
-                let adv_start = std::time::Instant::now();
-                if d.advance(now) {
-                    trace.set(crate::platform::perf::STAGE_ADVANCE, adv_start.elapsed());
+                let t_inj = std::time::Instant::now();
+                if let Some((x, y, t)) = live_bench_next_touch() {
+                    bench_touch(d, crate::ui::input::Action::Move, x, y, t);
+                }
+                let live_inj_us = t_inj.elapsed().as_micros() as u64;
+                let t_adv = std::time::Instant::now();
+                if d.advance(now) || live_active {
+                    trace.set(crate::platform::perf::STAGE_ADVANCE, t_adv.elapsed());
                     let build_start = std::time::Instant::now();
+                    crate::platform::perf::reset_build_sub();
                     let mut scene = d.render();
+                    let scene_us = build_start.elapsed().as_micros() as u64;
+                    let hud_start = std::time::Instant::now();
                     fps_hud.draw(&mut scene, frame_stats.fps());
+                    let hud_us = hud_start.elapsed().as_micros() as u64;
                     trace.set(crate::platform::perf::STAGE_BUILD, build_start.elapsed());
                     trace.cmd_count = scene.commands.len() as u32;
                     let render_start = std::time::Instant::now();
                     let ok = b.render_frame(scene).is_ok();
                     trace.set(crate::platform::perf::STAGE_RENDER, render_start.elapsed());
-                    Some((ok, trace))
+                    // 帧内各段用同一把墙钟尺子依次计时，用来定位"打点之和远小于
+                    // 墙钟总量"的真正归属（此前 gap 探针在错误层级，反查不出）。
+                    Some((ok, trace, live_inj_us, scene_us, hud_us))
                 } else {
                     None
                 }
             } else {
                 None
             };
-            if let Some((ok, trace)) = frame_result {
+            if let Some((ok, trace, inj_us, scene_us, hud_us)) = frame_result {
+                let t_post = std::time::Instant::now();
                 if ok {
                     frame_stats.record_render_time(
                         trace.stages[crate::platform::perf::STAGE_RENDER] / 1000,
                     );
                     frame_stats.record_trace(&trace);
                     frame_stats.record_frame();
+                    if live_active {
+                        live_bench_record();
+                        // 样本跑完抬笔，避免长期保持按压态影响后续手动测试。
+                        if !live_bench_active() {
+                            if let Some(d) = demo.as_mut() {
+                                bench_touch(d, crate::ui::input::Action::Up, 320.0, 820.0, 0);
+                            }
+                        }
+                    }
+                    log_frame(
+                        "anim",
+                        trace.stages[crate::platform::perf::STAGE_BUILD],
+                        trace.cmd_count as usize,
+                        trace.stages[crate::platform::perf::STAGE_RENDER],
+                    );
+                    if frame_log_enabled() {
+                        info!(
+                            "frame[phase] inj={}us adv={}us scene={}us hud={}us submit={}us post={}us",
+                            inj_us,
+                            trace.stages[crate::platform::perf::STAGE_ADVANCE],
+                            scene_us,
+                            hud_us,
+                            trace.stages[crate::platform::perf::STAGE_RENDER],
+                            t_post.elapsed().as_micros() as u64,
+                        );
+                    }
                 } else {
                     warn!("animation frame render failed");
                 }
@@ -1184,6 +1265,509 @@ fn main_loop(shared: Arc<Mutex<Shared>>) {
     info!("main loop exited");
 }
 
+/// 帧日志门控（`debug.nativeview.frame_log=1`，仅读一次）。
+///
+/// # 用途
+/// 真机上看每一帧的 `build/render` 拆分（默认关闭，避免日志本身吃帧预算）。
+#[cfg(target_os = "android")]
+pub fn frame_log_enabled() -> bool {
+    // 每帧现读属性：`property_get` 是共享内存读（亚微秒级），
+    // 而缓存会让人必须重启 App 才能改开关——调试时太难受。
+    crate::platform::android::sysprop::SysProp
+        .get("debug.nativeview.frame_log")
+        .is_some_and(|v| v.trim() != "0")
+}
+
+/// 慢帧阈值（`debug.nativeview.frame_slow=N`，单位 ms；0/缺省 = 关闭）。
+///
+/// # 用途
+/// 只打印超阈值的帧。整帧日志在 60fps 下每秒 60 行、把 logcat 淹没，
+/// 而定位「偶发丢节拍」只需要那几帧的相位。
+#[cfg(target_os = "android")]
+fn frame_slow_ms() -> Option<u64> {
+    crate::platform::android::sysprop::SysProp
+        .get("debug.nativeview.frame_slow")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// 输出一行帧耗时（含后端子阶段）。
+#[cfg(target_os = "android")]
+fn log_frame(label: &str, build_us: u64, cmds: usize, render_us: u64) {
+    let slow = frame_slow_ms();
+    let slow_hit = slow.is_some_and(|ms| (build_us + render_us) / 1000 >= ms);
+    if !frame_log_enabled() && !slow_hit {
+        return;
+    }
+    let sub = crate::platform::perf::sub_us();
+    let bsub = crate::platform::perf::build_sub_us();
+    let work = build_us + sub[0] + sub[1] + sub[2];
+    // 子阶段以「名称=耗时」成对输出，避免下标错位导致读数不可信。
+    let bdetail: String = crate::platform::perf::BUILD_SUB_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("{}={}", n, bsub[i]))
+        .collect::<Vec<_>>()
+        .join(" ");
+    log::info!(
+        "frame[{}{}] build={}us({}) cmds={} render={}us raster={}us upload={}us present={}us acquire={}us image={}us work={}us",
+        label,
+        if slow_hit { " slow" } else { "" },
+        build_us,
+        bdetail,
+        cmds,
+        render_us,
+        sub[crate::platform::perf::SUB_RASTER],
+        sub[crate::platform::perf::SUB_UPLOAD],
+        sub[crate::platform::perf::SUB_PRESENT],
+        sub[crate::platform::perf::SUB_ACQUIRE],
+        sub[crate::platform::perf::SUB_IMAGE],
+        work
+    );
+}
+
+/// 构建 + 渲染 + 统计的一体化入口（所有「状态变了要出帧」的路径共用）。
+///
+/// # 为什么集中
+/// 一帧的观测口径必须一致：build（Scene 命令生成）与 render（光栅/上传/呈现）
+/// 分开计时、失败只告警不中断主循环。散落的调用点各自写一套统计，
+/// 会让「同一个场景在不同触发路径下帧时长不可比」。
+#[cfg(target_os = "android")]
+fn render_and_record(
+    demo: &mut crate::demo::Demo,
+    backend: &mut AnyBackend,
+    stats: &mut crate::platform::perf::FrameStats,
+    label: &str,
+) -> bool {
+    let t_build = std::time::Instant::now();
+    crate::platform::perf::reset_build_sub();
+    let scene = demo.render();
+    let build_us = t_build.elapsed().as_micros() as u64;
+    let cmds = scene.commands.len();
+    let t_render = std::time::Instant::now();
+    let ok = backend.render_frame(scene).is_ok();
+    let render_us = t_render.elapsed().as_micros() as u64;
+    if ok {
+        stats.record_render_time(render_us / 1000);
+        stats.record_frame();
+        log_frame(label, build_us, cmds, render_us);
+    } else {
+        log::warn!("{} frame render failed", label);
+    }
+    ok
+}
+
+/// 当前线程累计 CPU 时间（微秒）。
+///
+/// # 为什么要它
+/// `Instant` 是墙钟：等 vsync、被调度器抢占的时间都会计入，导致
+/// 「这段代码花了 9ms」的结论完全失真。线程 CPU 时间只统计真正在跑的时间，
+/// 是判断「是否还有优化空间」的可靠口径。
+#[cfg(target_os = "android")]
+fn thread_cpu_us() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: 传入合法指针；CLOCK_THREAD_CPUTIME_ID 恒可用。
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec.max(0) as u64 * 1_000_000 + ts.tv_nsec.max(0) as u64 / 1000
+}
+
+/// 性能基准：连续渲染 N 帧并输出吞吐与各段耗时（`debug.nativeview.bench=N` 门控）。
+///
+/// # 与 vsync 解耦
+/// 基准不等待帧回调：每帧用「假时钟 +16ms」推进动画后立即渲染，
+/// 因此测到的是「一帧的 CPU/带宽成本」而不是 60Hz 节拍。吞吐上界 =
+/// `1000 / 每帧成本`，只有它 ≥60 才可能真正跑到 60fps。
+///
+/// # 参数
+/// - `debug.nativeview.bench`：帧数（0/缺省 = 关闭）；
+/// - `debug.nativeview.bench.warm`: 预热帧数（默认 5，让字形 atlas/缓冲热起来）。
+///
+/// # 输出
+/// 一行汇总：平均/中位/95 分位每帧成本、折算吞吐、raster/upload/present 均值。
+#[cfg(target_os = "android")]
+fn run_bench_if_requested(demo: &mut crate::demo::Demo, backend: &mut AnyBackend) {
+    use crate::platform::perf::{sub_us, SUB_COUNT};
+    use std::time::Instant;
+
+    let prop = |name: &str| {
+        crate::platform::android::sysprop::SysProp
+            .get(name)
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let iters = prop("debug.nativeview.bench");
+    if iters == 0 {
+        return;
+    }
+    let warm = prop("debug.nativeview.bench.warm").max(2);
+    let scenario = crate::platform::android::sysprop::SysProp
+        .get("debug.nativeview.bench.scenario")
+        .unwrap_or_default();
+    let draw = scenario.trim() == "draw";
+
+    // 落笔场景先导航到画板：作品库「＋」→ 新建页「创建画布」。
+    if draw {
+        for (x, y) in [(958.0, 210.0), (540.0, 2190.0)] {
+            bench_touch(demo, crate::ui::input::Action::Down, x, y, 0);
+            bench_touch(demo, crate::ui::input::Action::Up, x, y, 16);
+        }
+        // 一小段预热笔迹：让笔刷纹理、字形 atlas、预览位图都热起来。
+        bench_touch(demo, crate::ui::input::Action::Down, 320.0, 820.0, 0);
+        let _ = demo.render();
+    }
+
+    let _ = crate::platform::perf::take_frame_modes();
+    let mut costs = Vec::with_capacity(iters as usize);
+    let mut builds = Vec::with_capacity(iters as usize);
+    let mut subs = [0u64; SUB_COUNT];
+    let mut cmds = 0u64;
+    let mut ok_frames = 0u32;
+    let mut cpu_us_prev = thread_cpu_us();
+    let mut cpu_frames: Vec<u64> = Vec::with_capacity(iters as usize);
+    let mut prev_wall = Instant::now();
+    let mut miss = 0u32;
+    let t_all = Instant::now();
+    let mut t_ms = 0i64;
+    for i in 0..warm + iters {
+        t_ms += 16;
+        crate::platform::perf::reset_build_sub();
+        let t_build = Instant::now();
+        if draw {
+            // 每帧一个真实的 MOVE 打点（画板上的一条蛇形笔迹）；
+            // 同时推进动画时钟——落笔帧里的按压高亮/toast 是否过期由它决定。
+            let x = 320.0 + ((i * 37) % 560) as f32;
+            let y = 820.0 + ((i * 53) % 640) as f32;
+            let t_input = Instant::now();
+            bench_touch(demo, crate::ui::input::Action::Move, x, y, t_ms);
+            crate::platform::perf::add_build_sub_us(
+                crate::platform::perf::BUILD_SUB_INPUT,
+                t_input.elapsed(),
+            );
+        }
+        let t_adv = Instant::now();
+        let _ = demo.advance(t_ms as u64);
+        crate::platform::perf::add_build_sub_us(
+            crate::platform::perf::BUILD_SUB_ADVANCE,
+            t_adv.elapsed(),
+        );
+        let t_scene = Instant::now();
+        let scene = demo.render();
+        crate::platform::perf::add_build_sub_us(
+            crate::platform::perf::BUILD_SUB_SCENE,
+            t_scene.elapsed(),
+        );
+        let cmd_count = scene.commands.len() as u64;
+        let build_us = t_build.elapsed().as_micros() as u64;
+        let t_render = Instant::now();
+        let ok = backend.render_frame(scene).is_ok();
+        let work_us = t_render.elapsed().as_micros() as u64;
+        if !ok {
+            warn!("bench frame render failed at #{}, continuing", i);
+            continue;
+        }
+        let cpu_now = thread_cpu_us();
+        if i >= warm {
+            let cpu_delta = cpu_now.saturating_sub(cpu_us_prev);
+            cpu_frames.push(cpu_delta);
+            // 与上一帧的墙钟间隔：>17.5ms 说明掉了一帧（60Hz 预算 16.67ms）。
+            if prev_wall.elapsed().as_micros() as u64 > 17_500 {
+                miss += 1;
+            }
+            costs.push(work_us);
+            builds.push(build_us);
+            cmds += cmd_count;
+            ok_frames += 1;
+            let s = sub_us();
+            for k in 0..subs.len() {
+                subs[k] = subs[k].saturating_add(s[k]);
+            }
+        }
+        cpu_us_prev = cpu_now;
+        prev_wall = Instant::now();
+    }
+    let wall_all_us = t_all.elapsed().as_micros() as u64;
+    if draw {
+        bench_touch(demo, crate::ui::input::Action::Up, 320.0, 820.0, t_ms + 16);
+    }
+    if costs.is_empty() {
+        warn!("bench: no successful frame");
+        return;
+    }
+    let mut sorted = costs.clone();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let p50 = sorted[n / 2];
+    let p95 = sorted[(n * 95 / 100).min(n - 1)];
+    let avg: u64 = sorted.iter().sum::<u64>() / n as u64;
+    let mut bsorted = builds.clone();
+    bsorted.sort_unstable();
+    let build_p50 = bsorted[bsorted.len() / 2];
+    let build_max = bsorted[bsorted.len() - 1];
+    let fps = if avg > 0 { 1000.0 / avg as f32 * 1000.0 } else { 0.0 };
+    let per = u64::from(ok_frames.max(1));
+    // 「本帧真实工作量」= build + 光栅 + 上传 + 提交（不含等 vsync）。
+    // 只有它 ≤ 帧预算才可能稳稳 60fps；wall 时长在 FIFO 队列下含有等屏时间。
+    let work_avg = build_p50 + subs[0] / per + subs[1] / per + subs[2] / per;
+    let work_fps = if work_avg > 0 {
+        1_000_000.0 / work_avg as f32
+    } else {
+        0.0
+    };
+    let (partial_frames, full_frames) = crate::platform::perf::take_frame_modes();
+    let reasons = crate::platform::perf::take_damage_reasons();
+    let reason_text: String = crate::platform::perf::DAMAGE_REASON_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(_, _)| true)
+        .map(|(i, n)| format!("{}={}", n, reasons[i]))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let preview_avg = {
+        let b = crate::platform::perf::build_sub_us();
+        b[crate::platform::perf::BUILD_SUB_PREVIEW] / per
+    };
+    let input_avg = {
+        let b = crate::platform::perf::build_sub_us();
+        b[crate::platform::perf::BUILD_SUB_INPUT] / per
+    };
+    let adv_avg = {
+        let b = crate::platform::perf::build_sub_us();
+        b[crate::platform::perf::BUILD_SUB_ADVANCE] / per
+    };
+    let text_avg = {
+        let b = crate::platform::perf::build_sub_us();
+        b[crate::platform::perf::BUILD_SUB_TEXT] / per
+    };
+    let scene_avg = {
+        let b = crate::platform::perf::build_sub_us();
+        b[crate::platform::perf::BUILD_SUB_SCENE] / per
+    };
+    let tree_avg = {
+        let b = crate::platform::perf::build_sub_us();
+        b[crate::platform::perf::BUILD_SUB_TREE] / per
+    };
+    log::info!(
+        "bench[{}]: n={} cost avg={}us p50={}us p95={}us max={}us fps_ceiling={:.1} work={}us work_fps={:.1} build_p50={}us build_max={}us wall_avg={}us cpu_avg={}us cpu_p50={}us miss={}/{} bsub[{}] cmds_avg={} modes partial={} full={} [{}] sub raster={}us upload={}us present={}us acquire={}us image={}us",
+        if draw { "draw" } else { "static" },
+        n,
+        avg,
+        p50,
+        p95,
+        sorted[n - 1],
+        fps,
+        work_avg,
+        work_fps,
+        build_p50,
+        build_max,
+        wall_all_us / (warm + iters) as u64,
+        {
+            let mut c = cpu_frames.clone();
+            c.sort_unstable();
+            c.iter().sum::<u64>() / c.len().max(1) as u64
+        },
+        {
+            let mut c = cpu_frames.clone();
+            c.sort_unstable();
+            c[c.len() / 2]
+        },
+        miss,
+        cpu_frames.len() as u32,
+        {
+            let b = crate::platform::perf::build_sub_us();
+            crate::platform::perf::BUILD_SUB_NAMES
+                .iter()
+                .enumerate()
+                .map(|(i, n)| format!("{}={}", n, b[i] / per))
+                .collect::<Vec<_>>()
+                .join(" ")
+        },
+        cmds / per,
+        partial_frames,
+        full_frames,
+        reason_text,
+        subs[0] / per,
+        subs[1] / per,
+        subs[2] / per,
+        subs[3] / per,
+        subs[crate::platform::perf::SUB_IMAGE] / per,
+    );
+}
+
+/// 真 vsync 节奏的落笔实测状态（`debug.nativeview.bench.live=N` 门控）。
+///
+/// 与 `bench[draw]` 的「一口气渲染 N 帧」吞吐口径不同：这里每收到一次
+/// Choreographer 回调才注入一个 MOVE 再出帧，节拍等同于手指持续移动的真实
+/// 输入，因此 `miss` 就是用户能看到的掉帧数，而不是队列回压。
+struct LiveBench {
+    /// 剩余帧数（归零即打印汇总）。
+    left: u32,
+    /// 合成事件时间戳（16ms 步进）。
+    t_ms: i64,
+    /// 上一帧的墙钟起点与线程 CPU 累计。
+    last: std::time::Instant,
+    last_cpu: u64,
+    /// 帧间隔 / 线程 CPU 样本（微秒）。
+    intervals: Vec<u32>,
+    cpus: Vec<u32>,
+    /// 超出 60Hz 预算（>17.5ms）的帧数。
+    miss: u32,
+    /// 本帧转成预乘的像素数累加（判断增量是否真的只算小块）。
+    pixels: u64,
+}
+
+static LIVE_BENCH: std::sync::Mutex<Option<LiveBench>> = std::sync::Mutex::new(None);
+
+/// 按 `debug.nativeview.bench.live=N` 启动落笔实测：先导航到画板，再按住不抬。
+fn setup_live_bench(demo: &mut crate::demo::Demo) {
+    let n = crate::platform::android::sysprop::SysProp
+        .get("debug.nativeview.bench.live")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    for (x, y) in [(958.0, 210.0), (540.0, 2190.0)] {
+        bench_touch(demo, crate::ui::input::Action::Down, x, y, 0);
+        bench_touch(demo, crate::ui::input::Action::Up, x, y, 16);
+    }
+    // 按下不抬：整段实测是一笔连续划线，避免每帧重建按压态。
+    bench_touch(demo, crate::ui::input::Action::Down, 320.0, 820.0, 32);
+    let mut guard = match LIVE_BENCH.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    *guard = Some(LiveBench {
+        left: n,
+        t_ms: 32,
+        last: std::time::Instant::now(),
+        last_cpu: thread_cpu_us(),
+        intervals: Vec::with_capacity(n as usize),
+        cpus: Vec::with_capacity(n as usize),
+        miss: 0,
+        pixels: 0,
+    });
+    crate::platform::perf::take_premul_pixels();
+    info!("bench[live]: start n={}", n);
+}
+
+fn live_bench_active() -> bool {
+    match LIVE_BENCH.lock() {
+        Ok(g) => g.as_ref().is_some_and(|l| l.left > 0),
+        Err(_) => false,
+    }
+}
+
+/// 取本帧要注入的 MOVE（蛇形笔迹，坐标与时间戳都单调推进）。
+fn live_bench_next_touch() -> Option<(f32, f32, i64)> {
+    let mut guard = LIVE_BENCH.lock().ok()?;
+    let l = guard.as_mut()?;
+    if l.left == 0 {
+        return None;
+    }
+    l.t_ms += 16;
+    let i = l.t_ms / 16;
+    let x = 320.0 + ((i * 37) % 560) as f32;
+    let y = 820.0 + ((i * 53) % 640) as f32;
+    Some((x, y, l.t_ms))
+}
+
+/// 记录一帧的节拍与线程 CPU；样本收集完打印汇总。
+fn live_bench_record() {
+    let mut guard = match LIVE_BENCH.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let Some(l) = guard.as_mut() else {
+        return;
+    };
+    if l.left == 0 {
+        return;
+    }
+    let iv = l.last.elapsed().as_micros() as u32;
+    l.last = std::time::Instant::now();
+    let cpu_now = thread_cpu_us();
+    let cpu = cpu_now.saturating_sub(l.last_cpu) as u32;
+    l.last_cpu = cpu_now;
+    l.intervals.push(iv);
+    l.cpus.push(cpu);
+    l.pixels += crate::platform::perf::take_premul_pixels();
+    if iv > 17_500 {
+        l.miss += 1;
+    }
+    l.left -= 1;
+    if l.left > 0 {
+        return;
+    }
+    let n = l.intervals.len().max(1) as u64;
+    let mut ivs = l.intervals.clone();
+    ivs.sort_unstable();
+    let mut cs = l.cpus.clone();
+    cs.sort_unstable();
+    let avg: u64 = ivs.iter().map(|v| u64::from(*v)).sum::<u64>() / n;
+    let cpu_avg: u64 = cs.iter().map(|v| u64::from(*v)).sum::<u64>() / n;
+    let bsub = crate::platform::perf::build_sub_us();
+    let per = n.max(1);
+    let mut bbuf = String::new();
+    for k in 0..crate::platform::perf::BUILD_SUB_COUNT {
+        if k > 0 {
+            bbuf.push(' ');
+        }
+        bbuf.push_str(&format!(
+            "{}={}",
+            crate::platform::perf::BUILD_SUB_NAMES[k],
+            bsub[k] / per
+        ));
+    }
+    info!("bench[live]: bsub[{}]", bbuf);
+    info!(
+        "bench[live]: n={} iv_avg={}us iv_p50={}us iv_p95={}us iv_max={}us fps={:.1} cpu_avg={}us cpu_p50={}us miss={}/{} pix_avg={}",
+        n,
+        avg,
+        ivs[ivs.len() / 2],
+        ivs[(ivs.len() * 95 / 100).min(ivs.len() - 1)],
+        ivs[ivs.len() - 1],
+        1_000_000.0 / avg as f32,
+        cpu_avg,
+        cs[cs.len() / 2],
+        l.miss,
+        n,
+        l.pixels / per,
+    );
+}
+
+/// 合成一次触摸事件并派发给 demo（基准专用，不经过系统输入队列）。
+#[cfg(target_os = "android")]
+fn bench_touch(
+    demo: &mut crate::demo::Demo,
+    action: crate::ui::input::Action,
+    x: f32,
+    y: f32,
+    t_ms: i64,
+) -> bool {
+    let packed = match action {
+        crate::ui::input::Action::Down => 0,
+        crate::ui::input::Action::Up => 1,
+        crate::ui::input::Action::Move => 2,
+        _ => 3,
+    };
+    let ev = crate::ui::input::MotionEvent {
+        packed_action: packed,
+        down_time: 0,
+        event_time: t_ms,
+        pointers: vec![crate::ui::input::PointerCoords {
+            pointer_id: 0,
+            x,
+            y,
+            pressure: 1.0,
+        }],
+        historical: Vec::new(),
+    };
+    demo.dispatch_touch(&ev)
+}
+
 /// 输入泵取：借出 → 预分发 → 解码 → 路由 → 归还。
 ///
 /// # 分发线程不变量（PRD §5.2）
@@ -1220,7 +1804,9 @@ fn pump_input(
                     .decode_motion()
                     .map(|motion| {
                         let (x, y) = motion.primary().map(|p| (p.x, p.y)).unwrap_or((0.0, 0.0));
-                        info!("motion: action={:?} x={:.1} y={:.1}", motion.action(), x, y);
+                        // debug 级：move 事件每秒可达上百条，info 级写 socket 会直接
+                        // 把落笔帧拖慢（日志本身成了性能瓶颈）。
+                        debug!("motion: action={:?} x={:.1} y={:.1}", motion.action(), x, y);
                         handle_motion(&motion, demo.as_mut(), backend, frame_stats, fps_hud)
                     })
                     .unwrap_or(false);
@@ -1273,6 +1859,7 @@ fn handle_motion(
     }
     if consumed {
         let build_start = std::time::Instant::now();
+        crate::platform::perf::reset_build_sub();
         let mut scene = demo.render();
         fps_hud.draw(&mut scene, frame_stats.fps());
         trace.set(crate::platform::perf::STAGE_BUILD, build_start.elapsed());
@@ -1286,6 +1873,12 @@ fn handle_motion(
                     .record_render_time(trace.stages[crate::platform::perf::STAGE_RENDER] / 1000);
                 frame_stats.record_trace(&trace);
                 frame_stats.record_frame();
+                log_frame(
+                    "touch",
+                    trace.stages[crate::platform::perf::STAGE_BUILD],
+                    trace.cmd_count as usize,
+                    trace.stages[crate::platform::perf::STAGE_RENDER],
+                );
             } else {
                 warn!("touch frame render failed");
             }

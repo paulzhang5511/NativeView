@@ -321,8 +321,16 @@ pub struct Inkflow {
     pub preset_idx: usize,
     /// 滑杆改出的自定义参数；选预设时清空。
     custom_brush: Option<Brush>,
-    /// 画布预览缓存：`(像素指针, 宽, 高, 图)`。
+    /// 画布预览缓存：`(revision, 宽, 高, 图)`。
     preview: Option<(usize, u32, u32, Image)>,
+    /// 本帧可声明的脏区（`Some` = 只有这块变了）。默认 `None`（整帧）。
+    ///
+    /// 只在「确定整帧其余像素不可能变」时由画板落笔路径填写：画面静止、
+    /// 没有动效/面板/提示，且文档改动是刚发生的一小段笔迹。后端据此只重绘
+    /// 这一小块，落笔帧的光栅成本从整屏降到笔迹附近。
+    frame_damage: Option<Rect>,
+    /// 上一次真正出帧时的文档 revision（校验脏提示链条是否连续）。
+    rendered_doc_rev: u32,
     /// 画布视图缩放（1.0 = 整张塞满画布区）。
     pub zoom: f32,
     /// 画布视图平移（屏幕像素）。
@@ -395,6 +403,8 @@ impl Inkflow {
             preset_idx: 0,
             custom_brush: None,
             preview: None,
+            frame_damage: None,
+            rendered_doc_rev: 0,
             zoom: 1.0,
             pan: (0.0, 0.0),
             pinch: None,
@@ -560,9 +570,22 @@ impl Inkflow {
                 self.text_center(&mut labels, &toast, bar, sp(13.0), fg);
             }
         }
+        let t_merge = std::time::Instant::now();
         let mut finished = c.finish();
         scene.commands.extend(finished.commands.drain(..));
         scene.commands.extend(labels.commands.drain(..));
+        crate::platform::perf::add_build_sub_us(
+            crate::platform::perf::BUILD_SUB_MERGE,
+            t_merge.elapsed(),
+        );
+        // 脏区声明交给后端：`take` 保证「声明过一次」只作用于本帧。
+        scene.damage = self.frame_damage.take();
+        // 帧已出（含脏区部分重绘）：把文档版本推进到当前，并清脏提示链，
+        // 让下一帧的脏区从这一刻重新累计（否则 from_rev 永远对不上）。
+        if let Some(doc) = self.doc.as_ref() {
+            self.rendered_doc_rev = doc.revision();
+            doc.ack_dirty();
+        }
         // 切屏遮罩必须最后画：它要盖住文字，否则「淡入」只对图形生效。
         let cover = self.page_cover();
         if cover > 0.01 {

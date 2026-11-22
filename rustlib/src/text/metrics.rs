@@ -82,7 +82,7 @@ impl TextMeasurer {
         text: &str,
         max_advance: Option<f32>,
         tp: &TextPaint,
-    ) -> Option<TextLayout> {
+    ) -> Option<std::rc::Rc<TextLayout>> {
         let req = TextStyleRequest {
             text,
             font_size: tp.font_size,

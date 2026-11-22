@@ -35,30 +35,16 @@ unsafe extern "C" {
     pub fn AChoreographer_getInstance() -> *const AChoreographer;
 }
 
-/// 注册帧回调（同类型重复注册覆盖旧回调）。
+/// 注册一次性帧回调（下一个 vsync 生效，回调触发后自动摘除）。
 ///
-/// # 参数
-/// - `callback_type`：回调阶段（ANIMATION = 动画帧）；
-/// - `callback`：帧回调函数；
-/// - `data`：用户数据指针（原样传回回调）。
+/// # 命名
+/// 必须用 `AChoreographer_postFrameCallback64`：`postCallback`/`removeCallback`
+/// 在 libandroid 里并不存在（名字接近但会导致 dlopen 找不到符号而崩溃）。
 #[cfg(target_os = "android")]
 #[link(name = "android")]
 unsafe extern "C" {
-    pub fn AChoreographer_postCallback(
+    pub fn AChoreographer_postFrameCallback64(
         choreographer: *const AChoreographer,
-        callback_type: i32,
-        callback: FrameCallback,
-        data: *mut core::ffi::c_void,
-    );
-}
-
-/// 移除指定类型的帧回调。
-#[cfg(target_os = "android")]
-#[link(name = "android")]
-unsafe extern "C" {
-    pub fn AChoreographer_removeCallback(
-        choreographer: *const AChoreographer,
-        callback_type: i32,
         callback: FrameCallback,
         data: *mut core::ffi::c_void,
     );

@@ -185,6 +185,21 @@ pub struct Document {
     live_layer: usize,
     /// 实时笔画已落笔（供 UI 判断是否处于绘制中）。
     live_active: bool,
+    /// 脏提示：`(revision, 受影响矩形)`。
+    ///
+    /// # 用途与约束
+    /// 缩略图/预览缓存按 revision 失效，但整帧重建预览（1M+ 目标像素重采样）
+    /// 在每落一个点就要 5–20ms —— 60fps 的主要瓶颈。该提示让缓存持有者只
+    /// 重采样受影响的那一小块，结果与整帧重建**逐像素一致**（box 均值对每个
+    /// 输出像素独立）。
+    ///
+    /// 只记录「可局部化」的改动：撤销/重做/换层统一把 `dirty_valid` 置 false，
+    /// 表示缓存必须整帧重建。`dirty_hint` 的 revision 是**起始** revision
+    /// （改动发生前那帧的 revision），因此跨多个 revision（一帧内落了多个点）
+    /// 也能正确并起来。
+    dirty_hint: Cell<Option<(u32, DirtyRect)>>,
+    /// 脏提示是否仍然可用（false = 自上次整帧重建以来有过不可局部化的改动）。
+    dirty_valid: Cell<bool>,
 }
 
 impl Document {
@@ -217,12 +232,24 @@ impl Document {
             live_dirty: DirtyRect::empty(),
             live_layer: 0,
             live_active: false,
+            dirty_hint: Cell::new(None),
+            dirty_valid: Cell::new(false),
         }
     }
 
     /// 当前层引用。
     pub fn active_layer(&self) -> &Layer {
         &self.layers[self.active.min(self.layers.len() - 1)]
+    }
+
+    /// 当前层像素的只读借用（紧凑 RGBA8888，行长 `width*4`）。
+    ///
+    /// # 为什么不让调用方走 [`Self::image`]
+    /// `image()` 在版本号变化时要把整层像素拷进 `Arc`（1080×1920 ≈ 8MB，
+    /// 真机一次 ~4ms）。画板每帧只需要「读这些像素做降采样」，
+    /// 直接借用可把这次全图拷贝彻底省掉。
+    pub fn layer_pixels(&self) -> &[u8] {
+        &self.active_layer().pixels
     }
 
     /// 落一整笔到当前层并压入历史。
@@ -285,6 +312,7 @@ impl Document {
         });
         self.stroke_count = self.stroke_count.saturating_add(1);
         self.revision.set(self.revision.get() + 1);
+        self.mark_dirty_hint(dirty);
         true
     }
 
@@ -334,6 +362,7 @@ impl Document {
         }
         self.live_dirty = self.live_dirty.union(dirty);
         self.revision.set(self.revision.get() + 1);
+        self.mark_dirty_hint(dirty);
         true
     }
 
@@ -371,6 +400,7 @@ impl Document {
         });
         self.stroke_count = self.stroke_count.saturating_add(1);
         self.revision.set(self.revision.get() + 1);
+        self.mark_dirty_hint(dirty);
         true
     }
 
@@ -386,6 +416,7 @@ impl Document {
                 layer.pixels = before;
                 self.live_dirty = DirtyRect::empty();
                 self.revision.set(self.revision.get() + 1);
+                self.clear_dirty_hint();
                 return true;
             }
         }
@@ -402,6 +433,7 @@ impl Document {
         let changed = self.history.undo(&mut self.layers, self.width);
         if changed {
             self.revision.set(self.revision.get() + 1);
+            self.clear_dirty_hint();
         }
         changed
     }
@@ -411,6 +443,7 @@ impl Document {
         let changed = self.history.redo(&mut self.layers, self.width);
         if changed {
             self.revision.set(self.revision.get() + 1);
+            self.clear_dirty_hint();
         }
         changed
     }
@@ -439,7 +472,67 @@ impl Document {
         }
         self.active = i;
         self.revision.set(self.revision.get() + 1);
+        self.clear_dirty_hint();
         true
+    }
+
+    /// 记录一处可局部化的像素改动（与当前 revision 绑定）。
+    ///
+    /// # 合并语义
+    /// 同一 revision 内的多次记录取并集；revision 已前进（说明中间有过一次
+    /// 未被消费的改动）时以本次矩形覆盖——缓存方按 revision 校验，不会误用。
+    fn mark_dirty_hint(&self, rect: DirtyRect) {
+        if rect.is_empty() {
+            return;
+        }
+        if !self.dirty_valid.get() {
+            // 上一段链条已作废：以本条改动开启新链条（起始 = 本帧之前的 revision）。
+            self.dirty_hint
+                .set(Some((self.revision.get().saturating_sub(1), rect)));
+            self.dirty_valid.set(true);
+            return;
+        }
+        let merged = match self.dirty_hint.get() {
+            // 同一段连续局部改动：并集，起始 revision 保持不变。
+            Some((from, d)) => (from, d.union(rect)),
+            None => (self.revision.get().saturating_sub(1), rect),
+        };
+        self.dirty_hint.set(Some(merged));
+    }
+
+    /// 作废脏提示：本次改动无法用矩形局部化（撤销/重做/换层/整层恢复）。
+    fn clear_dirty_hint(&self) {
+        self.dirty_hint.set(None);
+        self.dirty_valid.set(false);
+    }
+
+    /// 声明「当前 revision 的画面已经出过帧」：脏提示链从这里重新累计。
+    ///
+    /// # 为什么必须由出帧方调用
+    /// 脏提示是「自上次出帧以来」的累计量。若不清链，链条会从很久以前开始，
+    /// `from_rev` 永远对不上上一帧的 revision，后端就只能整帧重绘——等于
+    /// 白做增量。出帧方（demo）在每帧 regen 之后调用一次即可。
+    pub fn ack_dirty(&self) {
+        self.dirty_hint.set(None);
+        self.dirty_valid.set(true);
+    }
+
+    /// 读取「自 `from_rev` 以来所有局部改动」的脏矩形：`(from_rev, 矩形)`。
+    ///
+    /// # 消费约定
+    /// 持有缩略图的缓存方若缓存 revision == `from_rev`，则只需重采样该矩形
+    /// 覆盖的输出像素（结果与整帧重建逐像素一致）；revision 不匹配、或返回
+    /// `None`（期间有不可局部化改动）时必须整帧重建。
+    ///
+    /// 返回值是该脏提示的**快照**，不会因后续改动而失效——缓存方据此把
+    /// 自己的 revision 推进到当前 revision 即可。
+    pub fn dirty_since(&self) -> Option<(u32, (u32, u32, u32, u32))> {
+        if !self.dirty_valid.get() {
+            return None;
+        }
+        self.dirty_hint
+            .get()
+            .map(|(from, d)| (from, (d.x0, d.y0, d.x1, d.y1)))
     }
 
     pub fn image(&self) -> Image {

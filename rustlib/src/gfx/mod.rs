@@ -8,6 +8,7 @@ pub mod canvas;
 pub mod color;
 pub mod image;
 pub mod matrix;
+pub mod parallel;
 pub mod paint;
 pub mod path;
 pub mod render;

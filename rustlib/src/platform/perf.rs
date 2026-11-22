@@ -138,6 +138,52 @@ static SUB_US: [AtomicU64; SUB_COUNT] = [
     AtomicU64::new(0),
 ];
 
+/// 每帧的光栅面积（像素）与是否整帧（诊断用：判断「名义局部、实际整幅」）。
+static RASTER_PIXELS: AtomicU64 = AtomicU64::new(0);
+static RASTER_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// 累加本帧光栅面积；`full` 表示这帧整帧重绘。
+pub fn add_raster_area(px: u64, full: bool) {
+    RASTER_PIXELS.fetch_add(px, Ordering::Relaxed);
+    if full {
+        RASTER_FULL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 读取并清零本帧光栅面积与整帧次数。
+pub fn take_raster_area() -> (u64, u64) {
+    (
+        RASTER_PIXELS.swap(0, Ordering::Relaxed),
+        RASTER_FULL.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// 每帧因 `Arc` 不独占而多出来的整幅拷贝字节数（诊断用）。
+static PREMUL_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// 累加本帧预乘时的退化拷贝字节数。
+pub fn add_premul_copy_bytes(n: u64) {
+    PREMUL_COPY_BYTES.fetch_add(n, Ordering::Relaxed);
+}
+
+/// 读取并清零本帧退化拷贝字节数。
+pub fn take_premul_copy_bytes() -> u64 {
+    PREMUL_COPY_BYTES.swap(0, Ordering::Relaxed)
+}
+
+/// 每帧实际 spawn 的辅助线程数（诊断用：小任务多线程会反噬）。
+static PAR_THREADS: AtomicU64 = AtomicU64::new(0);
+
+/// 累加本帧 spawn 的线程数。
+pub fn add_par_threads(n: u64) {
+    PAR_THREADS.fetch_add(n, Ordering::Relaxed);
+}
+
+/// 读取并清零本帧线程数。
+pub fn take_par_threads() -> u64 {
+    PAR_THREADS.swap(0, Ordering::Relaxed)
+}
+
 /// 每帧转成预乘的像素数（诊断用：判断增量路径是否真的只算了一小块）。
 static PREMUL_PIXELS: AtomicU64 = AtomicU64::new(0);
 

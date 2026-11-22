@@ -259,32 +259,32 @@ fn premul_rows_in(pm: &mut Pixmap, image: &Image, rect: (u32, u32, u32, u32)) {
     if x1 <= x0 || y1 <= y0 {
         return;
     }
+    let span = x1 - x0;
     let pixels = image.pixels();
     let buf = pm.data_mut();
     let rows = y1 - y0;
-    crate::platform::perf::add_premul_pixels((rows * (x1 - x0)) as u64);
+    crate::platform::perf::add_premul_pixels((rows * span) as u64);
+    // 只按「窗口内每行的一段」迭代：窗口常见是细长笔迹（几十列 × 上百行），
+    // 按整行迭代会把 95% 的时间花在跳过窗口外的列上（实测 110k 像素耗 2.2ms）。
     let band = &mut buf[y0 * w..y1 * w];
-    let min_rows = 24;
+    let min_rows = 16;
     crate::gfx::parallel::par_rows(band, rows, min_rows, |band, first_row| {
-        for (i, out) in band.iter_mut().enumerate() {
-            let row = first_row + i / w;
-            let col = i % w;
-            if col < x0 || col >= x1 {
-                continue;
+        let band_rows = band.len() / w;
+        for i in 0..band_rows {
+            let y = y0 + first_row + i;
+            let src = (y * w + x0) * 4;
+            let dst_off = i * w + x0;
+            let dst = &mut band[dst_off..dst_off + span];
+            let src_row = &pixels[src..src + span * 4];
+            for (out, px) in dst.iter_mut().zip(src_row.chunks_exact(4)) {
+                let a = px[3];
+                *out = vello_cpu::color::PremulRgba8 {
+                    r: ((px[0] as u16 * a as u16) / 255) as u8,
+                    g: ((px[1] as u16 * a as u16) / 255) as u8,
+                    b: ((px[2] as u16 * a as u16) / 255) as u8,
+                    a,
+                };
             }
-            let idx = (y0 + row) * w + col;
-            let (r, g, b, a) = (
-                pixels[idx * 4],
-                pixels[idx * 4 + 1],
-                pixels[idx * 4 + 2],
-                pixels[idx * 4 + 3],
-            );
-            *out = vello_cpu::color::PremulRgba8 {
-                r: ((r as u16 * a as u16) / 255) as u8,
-                g: ((g as u16 * a as u16) / 255) as u8,
-                b: ((b as u16 * a as u16) / 255) as u8,
-                a,
-            };
         }
     });
 }
@@ -319,6 +319,12 @@ fn premul_cache_acquire(
                 if let Some(arc) = cache.take((ptr, prev_rev)) {
                     // 上一帧 Scene 已释放时是唯一持有者，`make_mut` 不产生拷贝。
                     let mut arc = arc;
+                    if std::sync::Arc::strong_count(&arc) > 1 {
+                        // 上一帧还有持有者：下面这行会整幅克隆，诊断里单独记账。
+                        crate::platform::perf::add_premul_copy_bytes(
+                            u64::from(w) * u64::from(h) * 4,
+                        );
+                    }
                     let pm = std::sync::Arc::make_mut(&mut arc);
                     if pm.width() == w && pm.height() == h {
                         let bytes = u64::from(w) * u64::from(h) * 4;

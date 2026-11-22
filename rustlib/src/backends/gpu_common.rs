@@ -106,7 +106,18 @@ impl PixmapPresenter {
             Some(_) => true,
             None => raster.render(&scene, pixmap),
         };
+        if let Some(d) = damage.filter(|_| ready) {
+            if matches!(partial, Some(_)) {
+                crate::platform::perf::add_raster_area(
+                    d.w.max(0.0) as u64 * d.h.max(0.0) as u64,
+                    false,
+                );
+            }
+        }
         record_sub_us(SUB_RASTER, t_raster.elapsed());
+        if matches!(partial, None) {
+            crate::platform::perf::add_raster_area(0, true);
+        }
         if !ready {
             return Err(());
         }

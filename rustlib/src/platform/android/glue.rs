@@ -1616,6 +1616,12 @@ struct LiveBench {
     miss: u32,
     /// 本帧转成预乘的像素数累加（判断增量是否真的只算小块）。
     pixels: u64,
+    /// 本帧因 `Arc` 不独占多出的拷贝字节累加。
+    copy_bytes: u64,
+    /// 本帧 spawn 的辅助线程数累加。
+    threads: u64,
+    /// 本帧光栅面积（像素）累加。
+    raster_px: u64,
 }
 
 static LIVE_BENCH: std::sync::Mutex<Option<LiveBench>> = std::sync::Mutex::new(None);
@@ -1648,8 +1654,14 @@ fn setup_live_bench(demo: &mut crate::demo::Demo) {
         cpus: Vec::with_capacity(n as usize),
         miss: 0,
         pixels: 0,
+        copy_bytes: 0,
+        threads: 0,
+        raster_px: 0,
     });
     crate::platform::perf::take_premul_pixels();
+    crate::platform::perf::take_premul_copy_bytes();
+    crate::platform::perf::take_par_threads();
+    crate::platform::perf::take_raster_area();
     info!("bench[live]: start n={}", n);
 }
 
@@ -1694,6 +1706,10 @@ fn live_bench_record() {
     l.intervals.push(iv);
     l.cpus.push(cpu);
     l.pixels += crate::platform::perf::take_premul_pixels();
+    l.copy_bytes += crate::platform::perf::take_premul_copy_bytes();
+    let (area, _) = crate::platform::perf::take_raster_area();
+    l.raster_px += area;
+    l.threads += crate::platform::perf::take_par_threads();
     if iv > 17_500 {
         l.miss += 1;
     }
@@ -1721,9 +1737,37 @@ fn live_bench_record() {
             bsub[k] / per
         ));
     }
+    // 帧间隔直方图：把「平均 18ms 却说不清卡在哪」拆成节拍簇。
+    let bins = [12_000u32, 18_000, 24_000, 28_000, 35_000];
+    let mut hist = [0u64; 6];
+    for v in &l.intervals {
+        let mut k = 0usize;
+        while k < bins.len() && *v >= bins[k] {
+            k += 1;
+        }
+        hist[k] += 1;
+    }
+    info!(
+        "bench[live]: hist[<12={} <18={} <24={} <28={} <35={} >=35={}]",
+        hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]
+    );
+    // 脏区原因分布：周期性整帧重建会在这里露头（`rev_mismatch` / `page_shift`）。
+    let dr = crate::platform::perf::take_damage_reasons();
+    let mut dbuf = String::new();
+    for k in 0..crate::platform::perf::DAMAGE_REASON_COUNT {
+        if k > 0 {
+            dbuf.push(' ');
+        }
+        dbuf.push_str(&format!(
+            "{}={}",
+            crate::platform::perf::DAMAGE_REASON_NAMES[k],
+            dr[k] / per
+        ));
+    }
+    info!("bench[live]: damage[{}]", dbuf);
     info!("bench[live]: bsub[{}]", bbuf);
     info!(
-        "bench[live]: n={} iv_avg={}us iv_p50={}us iv_p95={}us iv_max={}us fps={:.1} cpu_avg={}us cpu_p50={}us miss={}/{} pix_avg={}",
+        "bench[live]: n={} iv_avg={}us iv_p50={}us iv_p95={}us iv_max={}us fps={:.1} cpu_avg={}us cpu_p50={}us miss={}/{} pix_avg={} copy_avg={} thr_avg={} rast_px_avg={}",
         n,
         avg,
         ivs[ivs.len() / 2],
@@ -1735,6 +1779,9 @@ fn live_bench_record() {
         l.miss,
         n,
         l.pixels / per,
+        l.copy_bytes / per,
+        l.threads / per,
+        l.raster_px / per,
     );
 }
 

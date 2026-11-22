@@ -34,6 +34,7 @@ where
         f(buf, 0);
         return;
     }
+    crate::platform::perf::add_par_threads(threads as u64);
     let band_rows = rows.div_ceil(threads);
     std::thread::scope(|scope| {
         for (i, band) in buf.chunks_mut(band_rows * per_row).enumerate() {

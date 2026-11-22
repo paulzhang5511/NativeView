@@ -19,3 +19,5 @@ rustlib/jniLibs/
 # 内部文档不随仓库发布（README 作为仓库门面保留）
 *.md
 !README.md
+# 唯一需要入库的文档：性能攻坚的实测记录（其余 *.md 仍不随仓库发布）
+!docs/verification.md

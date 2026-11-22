@@ -45,6 +45,22 @@ pub extern "system" fn Java_com_nativeview_app_MyNativeActivity_setDisplayDensit
     super::density::set_density(density, scaled_density);
 }
 
+/// Kotlin 侧注入系统动画时长倍率（`onCreate`/`onResume` 读 `ANIMATOR_DURATION_SCALE`）。
+///
+/// # 参数
+/// `scale`：1.0 为正常速度；0 表示用户已关闭系统动画，动效须立即落到终态。
+///
+/// # 安全
+/// 由 JNI 框架调用；参数为基本类型，无引用生命周期风险。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nativeview_app_MyNativeActivity_setAnimatorScale(
+    _env: jni::EnvUnowned,
+    _class: JClass,
+    scale: f32,
+) {
+    crate::platform::motion::set_animator_scale(scale);
+}
+
 /// Kotlin 侧挂载 IME 桥（`ImeBridge` 实例创建后调用一次）。
 ///
 /// # 参数

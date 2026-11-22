@@ -207,6 +207,7 @@ impl BitmapDrawable {
             image: self.image.clone(),
             x: bounds.x,
             y: bounds.y,
+            scale: 1.0,
         });
     }
 }

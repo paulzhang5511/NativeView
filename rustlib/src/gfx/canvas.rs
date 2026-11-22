@@ -176,11 +176,24 @@ impl Canvas {
 
     /// 位图绘制（矩阵烘焙为左上角目标点；V1 无混合模式，整图不透明搬运）。
     pub fn draw_image(&mut self, image: &Image, x: f64, y: f64) {
+        self.draw_image_scaled(image, x, y, 1.0);
+    }
+
+    /// 位图绘制并整体缩放：`scale` 为 1.0 时与原尺寸一致。
+    ///
+    /// 放大时不再重采样源图，而是把已有位图按比例铺开——缩放的手感连续，
+    /// 代价是超出源分辨率的部分会变软（对「放大看细节」是可接受的妥协）。
+    pub fn draw_image_scaled(&mut self, image: &Image, x: f64, y: f64, scale: f64) {
         let (x, y) = self.matrix.map_point(x, y);
         self.scene.commands.push(Command::DrawImage {
             image: image.clone(),
             x,
             y,
+            scale: if scale.is_finite() && scale > 0.0 {
+                scale
+            } else {
+                1.0
+            },
         });
     }
 
@@ -508,7 +521,7 @@ mod tests {
         c.draw_image(&img, 1.0, 2.0);
         let s = c.finish();
         match &s.commands[0] {
-            Command::DrawImage { image, x, y } => {
+            Command::DrawImage { image, x, y, .. } => {
                 assert_eq!(*x, 11.0);
                 assert_eq!(*y, 22.0);
                 assert_eq!(image.width(), img.width());

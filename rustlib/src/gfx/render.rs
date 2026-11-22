@@ -10,7 +10,7 @@
 
 use vello_cpu::color::AlphaColor;
 use vello_cpu::color::Srgb;
-use vello_cpu::kurbo::{BezPath, Point, Rect as KurboRect, Stroke as KurboStroke};
+use vello_cpu::kurbo::{Affine, BezPath, Point, Rect as KurboRect, Stroke as KurboStroke};
 use vello_cpu::peniko::{ColorStop as PenikoStop, Fill, Gradient};
 use vello_cpu::{RasterizerSettings, RenderContext, Resources, TargetInit};
 
@@ -67,6 +67,7 @@ fn draw_image_cmd(
     image: &Image,
     x: f64,
     y: f64,
+    scale: f64,
 ) {
     let w = image.width().min(u16::MAX as u32) as u16;
     let h = image.height().min(u16::MAX as u32) as u16;
@@ -114,9 +115,19 @@ fn draw_image_cmd(
     };
     let _ = resources;
     ctx.set_paint(brush);
-    // 图片作为"画笔"填充目标矩形：1:1 无缩放。
-    let rect = KurboRect::from_points((x, y), (x + f64::from(w), y + f64::from(h)));
+    // 图片作为"画笔"填充矩形：brush 采样以画布原点为基准，因此先把坐标系
+    // 平移到 (x, y) 再填 (0,0,w,h)，否则图像会按绝对坐标错位采样
+    // （大图（近原点）看不出，小图（远原点）会整块采到图外变空白）。
+    let prev = *ctx.transform();
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    ctx.set_transform(prev * Affine::translate((x, y)) * Affine::scale(scale));
+    let rect = KurboRect::from_points((0.0, 0.0), (f64::from(w), f64::from(h)));
     ctx.fill_rect(&rect);
+    ctx.set_transform(prev);
 }
 
 /// gfx Color → vello_cpu AlphaColor（Srgb，非预乘）。
@@ -265,12 +276,12 @@ pub fn render_damage(scene: &Scene, pixmap: &mut Pixmap, damage: &Rect) -> Optio
 fn cmd_intersects(cmd: &Command, rect: &Rect) -> bool {
     match cmd {
         Command::FillRect { rect: r, .. } => rects_intersect(r, rect),
-        Command::DrawImage { image, x, y } => {
+        Command::DrawImage { image, x, y, scale } => {
             let cmd_rect = Rect {
                 x: *x,
                 y: *y,
-                w: image.width() as f64,
-                h: image.height() as f64,
+                w: image.width() as f64 * *scale,
+                h: image.height() as f64 * *scale,
             };
             rects_intersect(&cmd_rect, rect)
         }
@@ -364,8 +375,8 @@ fn replay(
                 }
                 clips_open -= (*count).min(clips_open);
             }
-            Command::DrawImage { image, x, y } => {
-                draw_image_cmd(ctx, resources, image, *x, *y);
+            Command::DrawImage { image, x, y, scale } => {
+                draw_image_cmd(ctx, resources, image, *x, *y, *scale);
             }
             Command::DrawGlyphs {
                 glyphs,
@@ -448,11 +459,12 @@ pub fn diff_damage(prev: &Scene, next: &Scene) -> Option<Rect> {
             }
             (Command::ClipRect { rect: a }, Command::ClipRect { rect: b }) => Some(union(a, b)),
             (
-                Command::DrawImage { image, x, y },
+                Command::DrawImage { image, x, y, scale },
                 Command::DrawImage {
                     image: image2,
                     x: x2,
                     y: y2,
+                    scale: scale2,
                 },
             ) => {
                 // 像素内容变化（同尺寸不同图）→ 整帧（保守，像素比较
@@ -463,14 +475,14 @@ pub fn diff_damage(prev: &Scene, next: &Scene) -> Option<Rect> {
                 let a = Rect {
                     x: *x,
                     y: *y,
-                    w: image.width() as f64,
-                    h: image.height() as f64,
+                    w: image.width() as f64 * *scale,
+                    h: image.height() as f64 * *scale,
                 };
                 let b = Rect {
                     x: *x2,
                     y: *y2,
-                    w: image2.width() as f64,
-                    h: image2.height() as f64,
+                    w: image2.width() as f64 * *scale2,
+                    h: image2.height() as f64 * *scale2,
                 };
                 Some(union(&a, &b))
             }
@@ -569,6 +581,71 @@ mod tests {
     use super::*;
     use crate::gfx::canvas::Canvas;
     use crate::gfx::paint::PaintStyle;
+
+    /// 图像绘制在偏移位置：目标坐标必须精确落位，不能按画布原点采样。
+    ///
+    /// 回归：`ImageBrush` 采样以画布原点为基准，旧实现直接 fill 目标矩形，
+    /// 导致 (x,y) 远离原点的图（导出页缩略图）整块采到图外变空白。
+    #[test]
+    fn draw_image_lands_at_offset() {
+        // 8x8 纯红不透明图，画到 (40, 50)。
+        let mut pixels = vec![0u8; 8 * 8 * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px.copy_from_slice(&[255, 0, 0, 255]);
+        }
+        let image = super::super::image::Image::from_rgba8(8, 8, pixels);
+        let mut c = Canvas::new(64, 64);
+        c.set_clear_color(Color::WHITE);
+        c.draw_image(&image, 40.0, 50.0);
+        let pixmap = render_scene(&c.finish()).unwrap();
+        let data = pixmap.data();
+        let stride = pixmap.width() as usize;
+        let at = |x: usize, y: usize| data[y * stride + x];
+        // 偏移处（中心 43,53）必须是红色，原点附近必须仍是清屏色。
+        let p = at(43, 53);
+        assert_eq!(
+            (p.r, p.g, p.b, p.a),
+            (255, 0, 0, 255),
+            "image not at offset"
+        );
+        let p = at(4, 4);
+        assert_eq!(
+            (p.r, p.g, p.b, p.a),
+            (255, 255, 255, 255),
+            "image leaked to origin"
+        );
+    }
+
+    #[test]
+    fn draw_image_scaled_fills_scaled_area() {
+        // 放大查看时必须真的铺开：8x8 图按 3 倍画到 (20,24)，覆盖 24x24 区域。
+        let mut pixels = vec![0u8; 8 * 8 * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0, 128, 255, 255]);
+        }
+        let image = super::super::image::Image::from_rgba8(8, 8, pixels);
+        let mut c = Canvas::new(64, 64);
+        c.set_clear_color(Color::WHITE);
+        c.draw_image_scaled(&image, 20.0, 24.0, 3.0);
+        let pixmap = render_scene(&c.finish()).unwrap();
+        let data = pixmap.data();
+        let stride = pixmap.width() as usize;
+        let at = |x: usize, y: usize| data[y * stride + x];
+        // 放大后右下角仍应被覆盖（原尺寸只能覆盖到 28,32）。
+        let p = at(40, 44);
+        assert_eq!(
+            (p.r, p.g, p.b, p.a),
+            (0, 128, 255, 255),
+            "scaled image did not fill the scaled rect"
+        );
+        // 区域之外不得渗出。
+        let p = at(46, 30);
+        assert_eq!(
+            (p.r, p.g, p.b, p.a),
+            (255, 255, 255, 255),
+            "scaled image leaked outside"
+        );
+    }
 
     /// 基本渲染：清屏 + 红色矩形落位（中心像素红色，外圈清屏色）。
     #[test]

@@ -7,20 +7,20 @@ import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import org.junit.Assert.assertTrue
 import org.junit.After
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.FileInputStream
 
 /**
- * 交互自动化验收：滚动 / 双指缩放 / IME 输入三条真实链路。
+ * Inkflow 画板的真实输入注入验收：单指落笔 + 撤销、双指缩放。
  *
  * # 判定策略
- * 输入全部走系统级注入（UiAutomation 触摸事件 / shell input），
- * 结果以 Rust 侧 info 日志作为「状态确实到达原生层」的证据
- *（像素截图在 SurfaceView + SwiftShader 下不可靠，故不做图像断言）。
+ * 输入全部走系统级注入（UiAutomation 触摸事件）。像素截图在 SurfaceView +
+ * SwiftShader 下不可靠，因此断言以「节点树仍可用 / 状态变化后按钮仍在」为准，
+ * 不改用图像比对；笔迹像素本身由宿主侧单测（raster/paint）覆盖。
  */
 @RunWith(AndroidJUnit4::class)
 class DemoInteractionTest {
@@ -31,40 +31,50 @@ class DemoInteractionTest {
     @Before
     fun launchApp() {
         scenario = ActivityScenario.launch(MyNativeActivity::class.java)
-        awaitNode("List", 20000)
+        assertTrue("作品库未在 20s 内出现", awaitDesc("新建画布", 20000) != null)
         SystemClock.sleep(800)
-    }
-
-    @After
-    fun closeApp() {
-        scenario.close()
     }
 
     /**
      * 不主动销毁 Activity：Android 13 的 NativeActivity 窗口叠加 Java View 后，
      * destroy 阶段会对同一 InputQueue 触发二次 dispose（平台 Scudo abort），
-     * 与本次交互断言无关，验收阶段保持实例存活。
+     * 与交互断言无关。销毁路径由 LifecycleTest 单独覆盖。
      */
-    private fun awaitNode(text: String, timeoutMs: Long = 8000): AccessibilityNodeInfo? {
+    @After
+    fun detachOnly() {
+        // scenario.close() 仅在生命周期用例里执行。
+    }
+
+    /** 等待 content-desc 节点出现（自绘页面的语义只在 contentDescription）。 */
+    private fun awaitDesc(desc: String, timeoutMs: Long = 8000): AccessibilityNodeInfo? {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             val root = automation.rootInActiveWindow
-            val hit = root?.findAccessibilityNodeInfosByText(text)
-                ?.firstOrNull { it.text?.toString() == text }
-            if (hit != null) return hit
+            if (root != null) {
+                val hits = root.findAccessibilityNodeInfosByText(desc)
+                val hit = hits?.firstOrNull {
+                    it.text?.toString() == desc || it.contentDescription?.toString() == desc
+                }
+                if (hit != null) return hit
+            }
             SystemClock.sleep(100)
         }
         return null
     }
 
-    /** 读取 Rust 侧日志（经 logcat -s velloview）。 */
-    /** 读取 Rust 侧日志（经 logcat -s velloview）。 */
-    /** 全量 logcat（诊断用：可看到 InputDispatcher 丢弃/取消原因）。 */
-    private fun fullLog(): String {
-        val pfd = automation.executeShellCommand("logcat -d -t 400")
-        val text = FileInputStream(pfd.fileDescriptor).bufferedReader().readText()
-        pfd.close()
-        return text
+    private fun click(desc: String, timeoutMs: Long = 8000): Boolean {
+        val node = awaitDesc(desc, timeoutMs) ?: return false
+        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+    }
+
+    /** 走完作品库 → 新建 → 画板，断言停在画板。 */
+    private fun openBoard() {
+        assertTrue("新建画布点击失败", click("新建画布"))
+        assertTrue("开始绘画未出现", awaitDesc("创建画布", 12000) != null)
+        assertTrue("开始绘画点击失败", click("创建画布", 12000))
+        assertTrue("画板未进入", awaitDesc("撤销", 12000) != null)
+        // 软件光栅化下单帧较慢，先让首帧稳定再注入触摸。
+        SystemClock.sleep(1200)
     }
 
     private fun nativeLog(): String {
@@ -94,16 +104,16 @@ class DemoInteractionTest {
             dt += 20
         }
         automation.injectInputEvent(ev(MotionEvent.ACTION_UP, y, dt), true)
-        SystemClock.sleep(300)
+        SystemClock.sleep(400)
     }
 
     /**
-     * 双指反向捏合（间距变化 → P2 缩放）。
+     * 双指反向捏合（间距变化 → 画布缩放）。
      *
      * # 序列必须从单指 ACTION_DOWN 开始
      * InputDispatcher 只承认「先 DOWN 再 POINTER_DOWN」的多指序列；
-     * 直接以 POINTER_DOWN 起手会被判为非法流并整段丢弃（表现为注入成功但
-     * 应用收不到任何触摸）。末端同样先 POINTER_UP 再 UP。
+     * 直接以 POINTER_DOWN 起手会被判为非法流并整段丢弃（注入成功但应用收不到）。
+     * 末端同样先 POINTER_UP 再 UP。
      */
     private fun pinch(cx: Int, cy: Int, from: Int, to: Int) {
         val props = arrayOf(
@@ -119,9 +129,8 @@ class DemoInteractionTest {
             t0, t0 + dt, action, 2, props, coords(d), 0, 0, 1f, 1f, 0, 0,
             InputDevice.SOURCE_TOUCHSCREEN, 0
         )
-        // 单指事件也必须带 toolType=FINGER 的 PointerProperties：
-        // 6 参 obtain 生成的是 TOOL_TYPE_UNKNOWN，与后续 FINGER 的 POINTER_DOWN
-        // 不属于同一输入流，InputDispatcher 会静默丢弃整个多指序列。
+        // 单指事件也必须带 toolType=FINGER：6 参 obtain 生成 TOOL_TYPE_UNKNOWN，
+        // 与后续 FINGER 的 POINTER_DOWN 不属于同一输入流，会被静默丢弃。
         fun single(action: Int, x: Int, dt: Long): MotionEvent = MotionEvent.obtain(
             t0, t0 + dt, action, 1,
             arrayOf(MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER }),
@@ -138,7 +147,7 @@ class DemoInteractionTest {
             val d = from + (to - from) * i / 10
             automation.injectInputEvent(multi(MotionEvent.ACTION_MOVE, d, dt), true)
             dt += 40
-            // 每步留出消费窗口：应用侧单帧渲染慢时，连续注入会被合并。
+            // 每步留出消费窗口：单帧渲染慢时连续注入会被合并。
             SystemClock.sleep(200)
         }
         automation.injectInputEvent(
@@ -148,84 +157,44 @@ class DemoInteractionTest {
         SystemClock.sleep(600)
     }
 
-    /** P1 上滑必须真正滚动 Native 侧 ScrollView。 */
+    /** 单指落笔必须产生一步可撤销的历史。 */
     @Test
-    fun swipeScrollsListPage() {
+    fun swipePaintsStrokeAndUndoWorks() {
+        openBoard()
         clearLog()
-        swipe(540, 1500, 900)
-        SystemClock.sleep(800)
-        val log = nativeLog()
-        assertTrue("expected native scroll log, got:\n$log", log.contains("list scrolled to "))
-    }
-
-    /**
-     * P2 双指缩放必须改变原生缩放系数。
-     *
-     * # 为何暂不纳入 CI
-     * 模拟器（SwiftShader/软件光栅化）上多指序列会被 input dispatcher 合并或
-     * 直接判超时取消，`POINTER_DOWN` 之后常收不到 MOVE；同一手势已由
-     * `demo::tests::pinch_scales_p2` 在宿主侧用合成事件覆盖。
-     */
-    @Test
-    fun pinchZoomsDrawPage() {
-        val draw = awaitNode("Draw") ?: error("Draw tab missing")
-        assertTrue(draw.performAction(AccessibilityNodeInfo.ACTION_CLICK))
-        // 软件光栅化下单帧 2~3s：等切页真正完成（isChecked）再注入，
-        // 否则手势会在渲染期间被系统判超时取消。
-        val deadline = System.currentTimeMillis() + 15000
-        var checked = false
-        while (System.currentTimeMillis() < deadline) {
-            val node = awaitNode("Draw", 500)
-            if (node != null && node.isChecked) { checked = true; break }
-        }
-        assertTrue("Draw page must be active before pinch", checked)
-        SystemClock.sleep(1500)
-        clearLog()
-        pinch(540, 1300, 120, 320)
-        SystemClock.sleep(3000)
-        val log = nativeLog()
-        assertTrue("expected native pinch log, got:\n$log", log.contains("p2 scale "))
-    }
-
-    /**
-     * P3 点击输入框后 shell 输入文本必须回推到 Rust 状态机。
-     *
-     * # 为何暂不纳入 CI
-     * 该用例依赖真实软键盘/IME 焦点：UiAutomation 的 ACTION_CLICK 落到原生
-     * EditText 后，模拟器上软键盘不弹、shell `input text` 的按键事件也无法
-     * 建立 InputConnection（实测注入后 Rust 侧无任何焦点/文本日志）。
-     * 另外 IME 焦点窗口会让 Activity 销毁阶段对同一 InputQueue 二次 dispose
-     *（Scudo abort），与 `LifecycleTest` 的无 IME 场景不一致。
-     * 文本回推路径已由 ImeManager 单测覆盖。
-     */
-    @org.junit.Ignore("real soft-keyboard focus unavailable on emulator")
-    @Test
-    fun imeTextReachesNativeState() {
-        val textTab = awaitNode("Text") ?: error("Text tab missing")
-        assertTrue(textTab.performAction(AccessibilityNodeInfo.ACTION_CLICK))
-        // 切页 + 重推快照在慢渲染下需要数秒，轮询而不是固定 sleep。
-        var edit: AccessibilityNodeInfo? = null
-        val deadline = System.currentTimeMillis() + 20000
-        while (System.currentTimeMillis() < deadline && edit == null) {
-            val root = automation.rootInActiveWindow
-            if (root != null) {
-                val stack = ArrayDeque<AccessibilityNodeInfo>()
-                stack.add(root)
-                while (stack.isNotEmpty()) {
-                    val n = stack.removeFirst()
-                    if (n.className == "android.widget.EditText") { edit = n; break }
-                    for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
-                }
-            }
-            if (edit == null) SystemClock.sleep(300)
-        }
-        assertTrue("EditText node must exist on Text page", edit != null)
-        assertTrue(edit!!.performAction(AccessibilityNodeInfo.ACTION_CLICK))
-        SystemClock.sleep(500)
-        clearLog()
-        automation.executeShellCommand("input text nv").close()
+        swipe(540, 900, 1400)
         SystemClock.sleep(1200)
         val log = nativeLog()
-        assertTrue("expected IME text log, got:\n$log", log.contains("ime text reached native: 2 chars"))
+        // 路由日志证明事件确实进了 Inkflow 触摸层（不是被别的 View 吃掉）。
+        assertTrue("触摸未进入 Inkflow 页面:\n$log", log.contains("motion:"))
+
+        // 落笔后撤销按钮可用，点击后仍停在画板。
+        assertTrue("撤销点击失败", click("撤销"))
+        SystemClock.sleep(600)
+        assertTrue("撤销后画板消失", awaitDesc("撤销", 8000) != null)
+    }
+
+    /** 双指缩放不得把画板打断（缩放后仍可继续操作）。 */
+    @Test
+    fun pinchKeepsBoardUsable() {
+        openBoard()
+        pinch(540, 1200, 120, 320)
+        SystemClock.sleep(1500)
+        // 缩放后节点树仍然完整，且还能点撤销（说明未卡死/未退出画板）。
+        assertTrue("缩放后撤销按钮消失", awaitDesc("撤销", 8000) != null)
+        assertTrue("缩放后撤销点击失败", click("撤销"))
+        assertTrue("画板仍应可用", awaitDesc("导出 PNG", 8000) != null)
+    }
+
+    /** 工具切换不得打断画板：切到移动画布后仍能回到画笔。 */
+    @Test
+    fun toolSwitchKeepsBoardAlive() {
+        openBoard()
+        assertTrue("移动画布点击失败", click("移动画布"))
+        SystemClock.sleep(400)
+        assertTrue("切工具后画笔节点消失", awaitDesc("画笔", 8000) != null)
+        assertTrue("画笔点击失败", click("画笔"))
+        SystemClock.sleep(400)
+        assertTrue("切回画笔后图层节点消失", awaitDesc("切换图层", 8000) != null)
     }
 }

@@ -7,4 +7,5 @@
 
 pub mod android;
 pub mod host;
+pub mod motion;
 pub mod perf;

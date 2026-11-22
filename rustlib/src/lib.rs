@@ -10,6 +10,7 @@ pub mod anim;
 pub mod backends;
 pub mod demo;
 pub mod gfx;
+pub mod paint;
 pub mod platform;
 pub mod text;
 pub mod ui;

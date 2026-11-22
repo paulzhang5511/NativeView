@@ -5,6 +5,7 @@
 //! - `activity.rs` / `window.rs` / …：安全封装层（对上不暴露裸指针）。
 
 pub mod activity;
+pub mod app_paths;
 pub mod asset;
 /// 显示密度（dp/sp 换算基准；Kotlin 侧注入，未注入为 1.0）。
 pub mod density;

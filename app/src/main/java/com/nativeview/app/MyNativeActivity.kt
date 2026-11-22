@@ -3,6 +3,7 @@ package com.nativeview.app
 import android.app.NativeActivity
 import android.content.Context
 import android.os.Bundle
+import android.provider.Settings
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowManager
@@ -67,6 +68,9 @@ class MyNativeActivity : NativeActivity() {
         nativeSetA11yEnabled(am.isEnabled)
         am.addAccessibilityStateChangeListener(a11yStateListener)
 
+        // 动画倍率：跟随系统「移除动画」等无障碍设置（每次回前台重读）。
+        pushAnimatorScale()
+
         // insets 首次分发时注入 Rust（rootWindowInsets 此时尚未就绪，回调式最稳）。
         window.decorView.setOnApplyWindowInsetsListener { v, insets ->
             val status = insets.getInsets(WindowInsets.Type.statusBars()).top
@@ -77,6 +81,22 @@ class MyNativeActivity : NativeActivity() {
             setSystemBarInsets(status, nav)
             v.onApplyWindowInsets(insets)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 用户可能在后台期间修改了动画设置，回到前台时重新同步。
+        pushAnimatorScale()
+    }
+
+    /** 读取 `ANIMATOR_DURATION_SCALE` 并注入 Rust（缺失时按 1.0 正常速度）。 */
+    private fun pushAnimatorScale() {
+        val scale = Settings.Global.getFloat(
+            contentResolver,
+            Settings.Global.ANIMATOR_DURATION_SCALE,
+            1f
+        )
+        setAnimatorScale(scale)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -107,6 +127,9 @@ class MyNativeActivity : NativeActivity() {
 
     /** JNI：无障碍服务开关上报（Rust 侧门禁快照构建）。 */
     private external fun nativeSetA11yEnabled(enabled: Boolean)
+
+    /** JNI：系统动画倍率注入（0 = 用户关闭动画，Rust 侧动效立即落终态）。 */
+    private external fun setAnimatorScale(scale: Float)
 
     companion object {
         init {

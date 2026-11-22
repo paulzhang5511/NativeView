@@ -211,6 +211,31 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     // 启动链路第 2.5 步：预加载字体（Task 12 验证：mmap + fd 生命周期）。
     // 失败不阻断启动：文字功能在 Task 13 才接入渲染，此处仅验证加载链路。
     load_default_font(activity);
+
+    // 导出等落盘功能需要私有目录：onCreate 时记录 internalDataPath。
+    init_app_paths(activity);
+}
+
+/// 记录应用私有目录（`files`），供导出链路使用。
+///
+/// # 失败语义
+/// `internal_data_path` 为空时打 warn，导出回退到临时目录（仅桌面测试会走到）。
+#[cfg(target_os = "android")]
+fn init_app_paths(activity: *mut ANativeActivity) {
+    use std::ffi::CStr;
+    // SAFETY: activity 存活期间 internal_data_path 有效（头文件契约）。
+    let raw = unsafe { (*activity).internal_data_path };
+    if raw.is_null() {
+        warn!("internal data path unavailable, exports fall back to temp dir");
+        return;
+    }
+    match unsafe { CStr::from_ptr(raw) }.to_str() {
+        Ok(path) => {
+            info!("app files dir resolved: {}", path);
+            super::app_paths::set_files_dir(std::path::PathBuf::from(path));
+        }
+        Err(_) => warn!("internal data path is not valid utf-8"),
+    }
 }
 
 /// 加载默认字体并注入进程缓存（真机验证锚点 + Demo 页排版用）。

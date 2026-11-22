@@ -40,6 +40,11 @@ use crate::ui::widgets::layout::{FrameLayout, LinearLayout};
 use crate::ui::widgets::scroll_view::ScrollView;
 use crate::ui::widgets::text_view::{Ellipsize, TextAlignment, TextView};
 
+mod inkflow;
+mod inkflow_anim;
+
+use inkflow::Inkflow;
+
 /// 页签条高度 48dp（Android 标准触控条高度；640dpi 上为 192px）。
 fn tab_bar_height() -> f32 {
     crate::ui::dimen::dp(48.0)
@@ -66,6 +71,8 @@ pub enum Page {
     Text,
     /// P4 M3 组件陈列。
     Components,
+    /// Inkflow 涂鸦 App（默认页；旧四页保留为回归样例）。
+    Inkflow,
 }
 
 /// 演示主机：状态 + 装配 + 帧入口。
@@ -104,6 +111,8 @@ pub struct Demo {
     input_focused: bool,
     /// 页树重建代数（无障碍快照按此判断是否需要重推）。
     tree_generation: u32,
+    /// Inkflow 涂鸦 App 状态（默认页）。
+    ink: Inkflow,
     /// 窗口宽（px）。
     width: f32,
     /// 窗口高（px）。
@@ -129,8 +138,9 @@ impl Demo {
         let measurer = font
             .as_ref()
             .map(|f| TextMeasurer::new(TextContext::new(f)));
+        let ink = Inkflow::new(font.clone(), width as f32, height as f32, 0.0, 0.0);
         Self {
-            page: Page::List,
+            page: Page::Inkflow,
             highlighted_row: None,
             scroll_y: 0.0,
             animator,
@@ -144,6 +154,7 @@ impl Demo {
             input_composing: None,
             input_focused: false,
             tree_generation: 0,
+            ink,
             width: width as f32,
             height: height as f32,
         }
@@ -153,6 +164,12 @@ impl Demo {
     pub fn resize(&mut self, width: i32, height: i32) {
         self.width = width as f32;
         self.height = height as f32;
+        self.ink.resize(
+            self.width,
+            self.height,
+            crate::platform::android::insets::status_bar() as f32,
+            crate::platform::android::insets::nav_bar() as f32,
+        );
         self.invalidate_tree();
         // 后端 surface 尺寸变化由平台层重建后端（此处只作废页树）。
     }
@@ -240,6 +257,7 @@ impl Demo {
             Page::Draw => 1,
             Page::Text => 2,
             Page::Components => 3,
+            Page::Inkflow => 4,
         }
     }
 
@@ -282,6 +300,7 @@ impl Demo {
                 1 => Page::Draw,
                 2 => Page::Text,
                 3 => Page::Components,
+                4 => Page::Inkflow,
                 _ => self.page,
             };
         }
@@ -326,12 +345,21 @@ impl Demo {
                 log::info!("list scrolled to {:.1}", self.scroll_y);
             }
         }
-        anim_dirty || fling_dirty
+        // Inkflow 自绘页的动效：与滚动惯性共用同一帧时钟。
+        // 每帧同步系统动画倍率（用户可能随时在设置里切换「移除动画」）。
+        if self.page == Page::Inkflow {
+            self.ink
+                .set_animator_scale(crate::platform::motion::animator_scale());
+        }
+        let ink_dirty = self.page == Page::Inkflow && self.ink.advance(now_ms);
+        anim_dirty || fling_dirty || ink_dirty
     }
 
-    /// 是否需要持续帧驱动（P2 动画 / 滚动惯性）。
+    /// 是否需要持续帧驱动（P2 动画 / 滚动惯性 / Inkflow 交互动效）。
     pub fn needs_frames(&self) -> bool {
-        self.page == Page::Draw || self.fling_active()
+        self.page == Page::Draw
+            || self.fling_active()
+            || (self.page == Page::Inkflow && self.ink.needs_frames())
     }
 
     /// 滚动惯性是否仍在进行（由页树里的 ScrollView 报告）。
@@ -345,6 +373,10 @@ impl Demo {
     /// ScrollView 一旦进入拖拽态，只有 UP/CANCEL 能复位；窗口失焦后
     /// 系统不再投递后续触摸，若不合成 CANCEL，该实例会永久吞掉所有触摸。
     pub fn cancel_touch(&mut self) {
+        if self.page == Page::Inkflow {
+            self.ink.cancel_touch();
+            return;
+        }
         use crate::ui::input::motion_event::PointerCoords;
         let cancel = MotionEvent {
             packed_action: crate::ui::input::motion_event::Action::CANCEL,
@@ -395,7 +427,33 @@ impl Demo {
     /// # 返回
     /// true = 状态变更需要重绘。
     pub fn dispatch_touch(&mut self, motion: &MotionEvent) -> bool {
-        // 0) P2：双指缩放（Canvas 叠层整体缩放，手势独立于控件树）。
+        // 0) Inkflow：整页自绘，自命中测试（与树无关）。
+        if self.page == Page::Inkflow {
+            self.ink.resize(
+                self.width,
+                self.height,
+                self.insets_top(),
+                self.insets_bottom(),
+            );
+            let before = self.ink.screen;
+            let handled = self.ink.on_touch(motion);
+            // 只在页面切换或手势结束时重建树：一次笔画中途的 MOVE 会高频触发，
+            // 全部重建会白白流失绘制预算；选中态标签的刷新交给这些时机足够。
+            let navigating = matches!(motion.action(), crate::ui::input::Action::Move)
+                && self.ink.is_navigating();
+            if handled
+                && (self.ink.screen != before
+                    || navigating
+                    || matches!(
+                        motion.action(),
+                        crate::ui::input::Action::Up | crate::ui::input::Action::Cancel
+                    ))
+            {
+                self.invalidate_tree();
+            }
+            return handled;
+        }
+        // 1) P2：双指缩放（Canvas 叠层整体缩放，手势独立于控件树）。
         if self.page == Page::Draw && self.handle_pinch(motion) {
             return true;
         }
@@ -565,6 +623,13 @@ impl Demo {
         let Some(tag) = self.a11y_action_tag_of(node_id) else {
             return false;
         };
+        if self.page == Page::Inkflow {
+            if self.ink.perform_a11y(tag) {
+                self.invalidate_tree();
+                return true;
+            }
+            return false;
+        }
         match DemoAction::from_tag(tag) {
             Some(DemoAction::SwitchPage(page)) => {
                 if self.page == page {
@@ -604,6 +669,16 @@ impl Demo {
         let mut scene = Scene::new(self.width as u32, self.height as u32);
         scene.clear_color = Color::rgb(0x18, 0x18, 0x18);
         self.tree_for_layout().draw(&mut scene);
+        // Inkflow 自绘层（与树无关，整页 Scene 直绘）。
+        if self.page == Page::Inkflow {
+            self.ink.resize(
+                self.width,
+                self.height,
+                self.insets_top(),
+                self.insets_bottom(),
+            );
+            self.ink.render(&mut scene);
+        }
         // P2 叠加层（Canvas 原语 + 动画相位）。
         if self.page == Page::Draw {
             self.draw_p2_overlay(&mut scene);
@@ -618,6 +693,7 @@ impl Demo {
             Page::Draw => self.build_draw_page(),
             Page::Text => self.build_text_page(),
             Page::Components => self.build_components_page(),
+            Page::Inkflow => self.build_inkflow_page(),
         }
     }
 
@@ -884,6 +960,27 @@ impl Demo {
     /// 新组件大多不实现 `Widget` 装箱所需的完整接口组合（部分为
     /// 纯展示控件，无手势），V1 采用「Section 标题 + 组件行」的直排；
     /// 行高由各组件 measure 决定，容器只负责纵向堆叠。
+    /// Inkflow 页：结构树留空，整页由 `Inkflow::render` 直接写入 Scene。
+    fn build_inkflow_page(&mut self) -> PageTree {
+        let mut root = FrameLayout::new();
+        let top = self.content_top();
+        // 整页自绘，View 树只承载无障碍语义：每个视觉按钮对应一个透明节点，
+        // 位置与 Layout 命中矩形一致，TalkBack 聚焦顺序与视觉从上到下一致。
+        let nodes = self.ink.a11y_nodes();
+        for (rect, label, tag) in nodes {
+            let mut v = View::new();
+            v.set_content_description(label);
+            v.set_a11y_role(crate::ui::a11y::A11yRole::Button);
+            v.set_a11y_action_tag(tag);
+            v.set_clickable(true);
+            let mut lp = MarginLayoutParams::new(rect.w.round() as i32, rect.h.round() as i32);
+            lp.left_margin = rect.x as f32;
+            lp.top_margin = (rect.y as f32 - top).max(0.0);
+            root.add_child(v, lp, Gravity::TOP);
+        }
+        PageTree { root }
+    }
+
     fn build_components_page(&mut self) -> PageTree {
         let (mut root, _, _) = self.frame(tab_bar_height(), self.height);
         let content_h = self.content_bottom() - self.content_top() - tab_bar_height();
@@ -1112,6 +1209,7 @@ fn register_tab_switch(view: &View, page: Page) {
         Page::Draw => 1,
         Page::Text => 2,
         Page::Components => 3,
+        Page::Inkflow => 4,
     };
     gesture_registry::on(view.unique_id(), Gesture::Click, move || {
         PENDING_PAGE.store(code, std::sync::atomic::Ordering::Relaxed);
@@ -1135,6 +1233,7 @@ fn take_page() -> Option<Page> {
         1 => Some(Page::Draw),
         2 => Some(Page::Text),
         3 => Some(Page::Components),
+        4 => Some(Page::Inkflow),
         _ => None,
     }
 }
@@ -1196,6 +1295,7 @@ impl DemoAction {
             Page::Draw => 1,
             Page::Text => 2,
             Page::Components => 3,
+            Page::Inkflow => 4,
         }
     }
 
@@ -1211,6 +1311,7 @@ impl DemoAction {
             1 => Some(DemoAction::SwitchPage(Page::Draw)),
             2 => Some(DemoAction::SwitchPage(Page::Text)),
             3 => Some(DemoAction::SwitchPage(Page::Components)),
+            4 => Some(DemoAction::SwitchPage(Page::Inkflow)),
             t if t >= 1000 => Some(DemoAction::ToggleRow((t - 1000) as usize)),
             _ => None,
         }
@@ -1224,6 +1325,7 @@ fn page_label(page: Page) -> &'static str {
         Page::Draw => "Draw",
         Page::Text => "Text",
         Page::Components => "Components",
+        Page::Inkflow => "Inkflow",
     }
 }
 
@@ -1391,6 +1493,24 @@ mod tests {
         assert!(y > 100.0, "scroll_y must advance, got {y}");
     }
 
+    /// Inkflow 页的结构树承载无障碍语义：快照能读到按钮，点击可切屏。
+    #[test]
+    fn inkflow_page_exposes_a11y_nodes_and_click() {
+        let mut d = Demo::new(1080, 2400, None);
+        d.page = Page::Inkflow;
+        d.invalidate_tree();
+        let snapshot = d.a11y_snapshot();
+        let plus = snapshot
+            .iter()
+            .find(|n| n.content_description.contains("新建画布") || n.text.contains("新建画布"))
+            .expect("作品库必须有新建节点");
+        assert!(plus.clickable);
+        assert_eq!(plus.class_name, "android.widget.Button");
+        let id = plus.id;
+        assert!(d.perform_a11y_click(id));
+        assert_eq!(d.ink.screen, crate::demo::inkflow::Screen::NewCanvas);
+    }
+
     /// 四页均可装配渲染（无字体降级路径）。
     #[test]
     fn all_pages_render() {
@@ -1418,7 +1538,8 @@ mod tests {
     #[test]
     fn a11y_click_switches_page() {
         let mut d = Demo::new(1080, 2400, None);
-        assert_eq!(d.page, Page::List);
+        // 默认页已改为 Inkflow；本用例验证旧页签通路，先切到 List。
+        d.page = Page::List;
         // 先布局一次，使 a11y_action_tag_of 能拿到树。
         let _ = d.render();
         let nodes = d.a11y_snapshot();
@@ -1486,7 +1607,7 @@ mod tests {
     fn restore_empty_or_malformed_is_cold_start() {
         let mut d = Demo::new(1080, 2400, None);
         d.restore_state(&crate::ui::state::SavedState::new());
-        assert_eq!(d.page, Page::List);
+        assert_eq!(d.page, Page::Inkflow);
 
         // 畸形 JSON：from_json 返回 None，调用方跳过恢复。
         assert!(crate::ui::state::SavedState::from_json("{broken").is_none());

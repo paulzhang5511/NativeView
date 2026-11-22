@@ -156,6 +156,7 @@ impl ImageView {
             image: img.clone(),
             x: dst.x,
             y: dst.y,
+            scale: 1.0,
         });
     }
 }

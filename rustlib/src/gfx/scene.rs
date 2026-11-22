@@ -40,7 +40,13 @@ pub enum Command {
     /// 弹出 n 层裁剪（restore 语义：解除最近的 n 个 clip）。
     PopClips { count: u32 },
     /// 绘制位图（矩阵已烘焙：目标区域 + 像素由 `Arc` 共享零拷贝）。
-    DrawImage { image: Image, x: f64, y: f64 },
+    DrawImage {
+        image: Image,
+        x: f64,
+        y: f64,
+        /// 目标缩放（1.0 = 原尺寸）；放大时不重采样源图，直接按比例铺开。
+        scale: f64,
+    },
     /// 绘制已定位字形组（text 栈排版产物，基线系坐标 + 全局字体）。
     DrawGlyphs {
         /// 字形列表（glifo `Glyph` 语义：id + x/y）。

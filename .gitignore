@@ -21,3 +21,4 @@ rustlib/jniLibs/
 !README.md
 # 唯一需要入库的文档：性能攻坚的实测记录（其余 *.md 仍不随仓库发布）
 !docs/verification.md
+!docs/pitfalls.md
